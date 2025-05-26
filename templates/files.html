@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hacker Cockpit - File Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #1a1a1a; color: #ffffff; font-family: 'Courier New', monospace; }
+        .nav-bar { background-color: #2d2d2d; }
+        .glow { text-shadow: 0 0 10px #ffffff; }
+        .nav-button { transition: background-color 0.3s; }
+        .logo { position: fixed; bottom: 10px; left: 10px; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+    <div class="nav-bar flex justify-between p- Grok, created by xAI
+    <div class="flex space-x-2">
+        <a href="/" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Dashboard</a>
+        <a href="/services" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Services</a>
+        <a href="/logs" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Logs</a>
+        <a href="/files" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Files</a>
+        <a href="/packages" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Packages</a>
+        <a href="/users" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Users</a>
+        <a href="/pentest" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Penetration Testing</a>
+        <a href="/search" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Web Search</a>
+        <a href="/gaming" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Gaming News</a>
+        <a href="/cybersecurity" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Cybersecurity News</a>
+        <a href="/network" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Network</a>
+        <a href="/diagnostics" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Diagnostics</a>
+        <a href="/terminal" class="nav-button py-2 px-4 bg-gray-700 hover:bg-gray-600 rounded">Terminal</a>
+    </div>
+</div>
+<div class="flex-1 p-8">
+    <h2 class="text-3xl glow mb-6">File Explorer</h2>
+    <div class="bg-gray-800 p-4 rounded-lg">
+        <p>Current Path: {{ path }}</p>
+        <ul>
+            {% for file in files %}
+            <li><a href="/files?path={{ path }}/{{ file.name }}" class="hover:text-gray-300">{{ file.name }} {% if file.is_dir %}(Dir){% endif %}</a></li>
+            {% endfor %}
+        </ul>
+    </div>
+</div>
+<img src="/logo" alt="HackerOS Logo" class="logo w-24 h-24">
+</body>
+</html>
