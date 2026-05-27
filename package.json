@@ -1,0 +1,15 @@
+{
+  "name": "hackeros-cockpit",
+  "version": "2.0.0",
+  "description": "HackerOS System Dashboard — TypeScript/Bun edition",
+  "main": "source-code/server.ts",
+  "scripts": {
+    "start": "bun run source-code/server.ts",
+    "build": "bun build source-code/server.ts --compile --outfile hacker-cockpit",
+    "dev": "bun --watch run source-code/server.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
