@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HackerCockpit // v2</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg:       #080b0f;
+      --bg2:      #0d1117;
+      --bg3:      #111820;
+      --border:   #1e2d3d;
+      --accent:   #00ff9d;
+      --accent2:  #00ccff;
+      --accent3:  #ff3366;
+      --accent4:  #ffaa00;
+      --text:     #c8d6e5;
+      --text-dim: #4a6080;
+      --text-muted: #2a3f55;
+      --glow:     0 0 20px rgba(0,255,157,0.3);
+      --glow2:    0 0 20px rgba(0,204,255,0.3);
+      --font-mono: 'JetBrains Mono', monospace;
+      --font-display: 'Orbitron', sans-serif;
+      --font-ui: 'Share Tech Mono', monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-mono); overflow: hidden; }
+
+    /* Scanline effect */
+    body::after {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+      pointer-events: none; z-index: 9999;
+    }
+
+    /* Grid noise background */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(0,255,157,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,255,157,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none; z-index: 0;
+    }
+
+    /* ─── Layout ─────────────────────────────────────────────── */
+    #app { display: flex; height: 100vh; position: relative; z-index: 1; }
+
+    /* ─── Sidebar ─────────────────────────────────────────────── */
+    #sidebar {
+      width: 220px; min-width: 220px;
+      background: linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+    #sidebar::before {
+      content: '';
+      position: absolute; top: 0; right: 0; bottom: 0; width: 1px;
+      background: linear-gradient(180deg, transparent, var(--accent), transparent);
+      opacity: 0.4;
+    }
+
+    .sidebar-header {
+      padding: 20px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-logo {
+      font-family: var(--font-display);
+      font-size: 11px; font-weight: 900;
+      color: var(--accent);
+      text-shadow: var(--glow);
+      letter-spacing: 2px;
+      line-height: 1.4;
+    }
+    .sidebar-logo span { color: var(--accent2); }
+    .sidebar-version {
+      font-size: 9px; color: var(--text-dim); margin-top: 2px; letter-spacing: 1px;
+    }
+
+    .sidebar-status {
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 9px; color: var(--text-dim);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .status-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    .sidebar-nav { flex: 1; overflow-y: auto; padding: 8px 0; }
+    .sidebar-nav::-webkit-scrollbar { width: 3px; }
+    .sidebar-nav::-webkit-scrollbar-thumb { background: var(--border); }
+
+    .nav-section-label {
+      font-size: 8px; color: var(--text-muted); letter-spacing: 2px;
+      padding: 12px 16px 4px; text-transform: uppercase;
+    }
+
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 16px; cursor: pointer;
+      font-size: 11px; color: var(--text-dim);
+      transition: all 0.15s; position: relative;
+      border: none; background: none; width: 100%; text-align: left;
+      font-family: var(--font-ui);
+    }
+    .nav-item:hover { color: var(--text); background: rgba(0,255,157,0.04); }
+    .nav-item.active {
+      color: var(--accent);
+      background: rgba(0,255,157,0.08);
+    }
+    .nav-item.active::before {
+      content: '';
+      position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+      background: var(--accent); box-shadow: var(--glow);
+    }
+    .nav-icon { font-size: 13px; width: 16px; text-align: center; }
+
+    /* ─── Main content ────────────────────────────────────────── */
+    #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    #topbar {
+      height: 44px; min-height: 44px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg2);
+      display: flex; align-items: center; padding: 0 20px;
+      justify-content: space-between;
+    }
+    .topbar-title {
+      font-family: var(--font-display);
+      font-size: 11px; letter-spacing: 3px;
+      color: var(--accent); text-shadow: var(--glow);
+    }
+    .topbar-info {
+      display: flex; gap: 20px; font-size: 9px; color: var(--text-dim); font-family: var(--font-ui);
+    }
+    .topbar-info span { color: var(--text); }
+
+    #content {
+      flex: 1; overflow-y: auto; padding: 20px;
+    }
+    #content::-webkit-scrollbar { width: 4px; }
+    #content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ─── Page views ─────────────────────────────────────────── */
+    .page { display: none; }
+    .page.active { display: block; animation: fadeIn 0.2s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+
+    /* ─── Page header ─────────────────────────────────────────── */
+    .page-header { margin-bottom: 20px; }
+    .page-title {
+      font-family: var(--font-display);
+      font-size: 18px; font-weight: 700;
+      color: var(--accent); text-shadow: var(--glow);
+      letter-spacing: 2px;
+    }
+    .page-subtitle { font-size: 10px; color: var(--text-dim); margin-top: 4px; letter-spacing: 1px; }
+
+    /* ─── Cards ──────────────────────────────────────────────── */
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 16px;
+      margin-bottom: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+    .card::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      opacity: 0.3;
+    }
+    .card-title {
+      font-size: 10px; color: var(--accent2); letter-spacing: 2px;
+      text-transform: uppercase; margin-bottom: 12px; font-family: var(--font-ui);
+    }
+
+    /* ─── Stats grid ─────────────────────────────────────────── */
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    @media (max-width: 1200px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+
+    .stat-card {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 14px 16px;
+      position: relative; overflow: hidden;
+    }
+    .stat-label { font-size: 9px; color: var(--text-dim); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 6px; font-family: var(--font-ui); }
+    .stat-value { font-family: var(--font-display); font-size: 22px; font-weight: 700; color: var(--accent); }
+    .stat-unit { font-size: 10px; color: var(--text-dim); margin-left: 4px; }
+    .stat-bar { margin-top: 8px; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .stat-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 2px; transition: width 0.5s; }
+    .stat-bar-fill.warn { background: var(--accent4); }
+    .stat-bar-fill.danger { background: var(--accent3); }
+
+    /* ─── Process table ──────────────────────────────────────── */
+    .data-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .data-table th {
+      text-align: left; padding: 6px 10px;
+      font-size: 9px; color: var(--text-dim); letter-spacing: 2px;
+      border-bottom: 1px solid var(--border); font-family: var(--font-ui);
+      font-weight: 400;
+    }
+    .data-table td { padding: 6px 10px; border-bottom: 1px solid rgba(30,45,61,0.5); color: var(--text); }
+    .data-table tr:hover td { background: rgba(0,255,157,0.03); }
+    .data-table .mono { font-family: var(--font-mono); }
+
+    .badge {
+      display: inline-block; padding: 1px 6px; border-radius: 2px;
+      font-size: 9px; letter-spacing: 1px; font-family: var(--font-ui);
+    }
+    .badge-green { background: rgba(0,255,157,0.15); color: var(--accent); border: 1px solid rgba(0,255,157,0.3); }
+    .badge-red { background: rgba(255,51,102,0.15); color: var(--accent3); border: 1px solid rgba(255,51,102,0.3); }
+    .badge-yellow { background: rgba(255,170,0,0.15); color: var(--accent4); border: 1px solid rgba(255,170,0,0.3); }
+    .badge-blue { background: rgba(0,204,255,0.15); color: var(--accent2); border: 1px solid rgba(0,204,255,0.3); }
+
+    /* ─── Grid 2/3 col ───────────────────────────────────────── */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+    @media (max-width: 1100px) { .grid-2,.grid-3 { grid-template-columns: 1fr; } }
+
+    /* ─── Terminal ───────────────────────────────────────────── */
+    .terminal-window {
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .terminal-titlebar {
+      background: var(--bg3);
+      padding: 6px 12px;
+      font-size: 9px; color: var(--text-dim);
+      display: flex; align-items: center; gap: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+    .terminal-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .terminal-output {
+      min-height: 300px; max-height: 450px;
+      overflow-y: auto;
+      padding: 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--accent);
+    }
+    .terminal-output::-webkit-scrollbar { width: 4px; }
+    .terminal-output::-webkit-scrollbar-thumb { background: var(--border); }
+    .terminal-line { display: flex; }
+    .terminal-prompt { color: var(--accent2); margin-right: 8px; white-space: nowrap; }
+    .terminal-cmd { color: var(--text); }
+    .terminal-result { color: #aaa; white-space: pre-wrap; word-break: break-all; }
+    .terminal-error { color: var(--accent3); }
+
+    .terminal-input-row {
+      display: flex; align-items: center;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--bg3);
+      gap: 8px;
+    }
+    .terminal-ps1 { color: var(--accent); font-size: 12px; white-space: nowrap; }
+
+    /* ─── Form elements ───────────────────────────────────────── */
+    .hk-input {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--text);
+      padding: 8px 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.2s;
+      width: 100%;
+    }
+    .hk-input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(0,255,157,0.2); }
+    .hk-input::placeholder { color: var(--text-muted); }
+
+    .hk-select {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      border-radius: 3px;
+      outline: none;
+      cursor: pointer;
+    }
+    .hk-select:focus { border-color: var(--accent); }
+
+    .hk-btn {
+      background: transparent;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      padding: 8px 16px;
+      font-family: var(--font-ui);
+      font-size: 11px; letter-spacing: 1px;
+      border-radius: 3px;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .hk-btn:hover { background: rgba(0,255,157,0.1); box-shadow: var(--glow); }
+    .hk-btn.red { border-color: var(--accent3); color: var(--accent3); }
+    .hk-btn.red:hover { background: rgba(255,51,102,0.1); }
+    .hk-btn.blue { border-color: var(--accent2); color: var(--accent2); }
+    .hk-btn.blue:hover { background: rgba(0,204,255,0.1); }
+    .hk-btn.yellow { border-color: var(--accent4); color: var(--accent4); }
+    .hk-btn.yellow:hover { background: rgba(255,170,0,0.1); }
+    .hk-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .input-row { display: flex; gap: 8px; align-items: center; }
+
+    /* ─── Loader ─────────────────────────────────────────────── */
+    .loading {
+      display: flex; align-items: center; gap: 10px;
+      color: var(--text-dim); font-size: 11px; padding: 20px 0;
+    }
+    .loading-spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Log viewer ─────────────────────────────────────────── */
+    .log-container {
+      background: #000; border: 1px solid var(--border);
+      border-radius: 4px; padding: 12px;
+      max-height: 500px; overflow-y: auto;
+      font-size: 11px; line-height: 1.7;
+      font-family: var(--font-mono);
+    }
+    .log-container::-webkit-scrollbar { width: 4px; }
+    .log-container::-webkit-scrollbar-thumb { background: var(--border); }
+    .log-line { color: #8899aa; }
+    .log-line.err { color: var(--accent3); }
+    .log-line.warn { color: var(--accent4); }
+    .log-line.info { color: var(--accent2); }
+
+    /* ─── News cards ─────────────────────────────────────────── */
+    .news-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    @media (max-width: 1100px) { .news-grid { grid-template-columns: 1fr; } }
+    .news-item {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 14px;
+      transition: border-color 0.2s;
+    }
+    .news-item:hover { border-color: rgba(0,204,255,0.4); }
+    .news-title { font-size: 12px; color: var(--accent2); margin-bottom: 6px; line-height: 1.4; }
+    .news-title a { color: inherit; text-decoration: none; }
+    .news-title a:hover { color: var(--accent); }
+    .news-summary { font-size: 10px; color: var(--text-dim); line-height: 1.5; }
+
+    /* ─── Service rows ────────────────────────────────────────── */
+    .service-row {
+      display: flex; align-items: center;
+      padding: 10px 0; border-bottom: 1px solid rgba(30,45,61,0.5);
+      gap: 12px;
+    }
+    .service-name { flex: 1; font-size: 12px; color: var(--text); }
+    .service-status { min-width: 80px; }
+
+    /* ─── File browser ────────────────────────────────────────── */
+    .file-row {
+      display: flex; align-items: center;
+      padding: 6px 8px; gap: 10px;
+      border-radius: 3px; cursor: pointer;
+      transition: background 0.1s;
+    }
+    .file-row:hover { background: rgba(0,255,157,0.05); }
+    .file-icon { width: 16px; text-align: center; font-size: 12px; }
+    .file-name { flex: 1; font-size: 11px; color: var(--text); }
+    .file-size { font-size: 10px; color: var(--text-dim); min-width: 60px; text-align: right; }
+    .file-date { font-size: 10px; color: var(--text-muted); min-width: 130px; text-align: right; }
+
+    /* ─── Diagnostic grid ─────────────────────────────────────── */
+    .diag-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    @media (max-width: 900px) { .diag-grid { grid-template-columns: 1fr; } }
+    .diag-card {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 4px; padding: 16px; text-align: center;
+    }
+    .diag-icon { font-size: 28px; margin-bottom: 8px; }
+    .diag-name { font-size: 10px; color: var(--text-dim); letter-spacing: 2px; margin-bottom: 6px; font-family: var(--font-ui); }
+    .diag-value { font-family: var(--font-display); font-size: 28px; font-weight: 700; }
+    .diag-value.ok { color: var(--accent); }
+    .diag-value.warn { color: var(--accent4); }
+    .diag-value.err { color: var(--accent3); }
+    .diag-sub { font-size: 9px; color: var(--text-dim); margin-top: 4px; }
+
+    /* ─── Toast ──────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: var(--bg3); border: 1px solid var(--accent);
+      padding: 10px 16px; border-radius: 4px;
+      font-size: 11px; color: var(--accent);
+      transform: translateY(60px); opacity: 0;
+      transition: all 0.25s; z-index: 1000;
+      box-shadow: var(--glow);
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.err { border-color: var(--accent3); color: var(--accent3); box-shadow: none; }
+
+    /* ─── Breadcrumb ─────────────────────────────────────────── */
+    .breadcrumb {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 10px; color: var(--text-dim); margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .breadcrumb-item { cursor: pointer; color: var(--accent2); }
+    .breadcrumb-item:hover { color: var(--accent); }
+    .breadcrumb-sep { color: var(--text-muted); }
+
+    /* ─── Scrollbar global ───────────────────────────────────── */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- Sidebar -->
+  <nav id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">HACKER<span>COCKPIT</span></div>
+      <div class="sidebar-version">// v2.0 — HackerOS</div>
+    </div>
+    <div class="sidebar-status">
+      <div class="status-dot"></div>
+      <span id="sidebar-hostname">SYSTEM ONLINE</span>
+    </div>
+    <div class="sidebar-nav">
+      <div class="nav-section-label">// system</div>
+      <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⬡</span>Dashboard</button>
+      <button class="nav-item" data-page="services"><span class="nav-icon">⚙</span>Services</button>
+      <button class="nav-item" data-page="logs"><span class="nav-icon">▤</span>Logs</button>
+      <button class="nav-item" data-page="diagnostics"><span class="nav-icon">◈</span>Diagnostics</button>
+
+      <div class="nav-section-label">// tools</div>
+      <button class="nav-item" data-page="terminal"><span class="nav-icon">$</span>Terminal</button>
+      <button class="nav-item" data-page="files"><span class="nav-icon">◫</span>File Explorer</button>
+      <button class="nav-item" data-page="packages"><span class="nav-icon">⬡</span>Packages</button>
+      <button class="nav-item" data-page="users"><span class="nav-icon">◉</span>Users &amp; Groups</button>
+      <button class="nav-item" data-page="network"><span class="nav-icon">◎</span>Network</button>
+      <button class="nav-item" data-page="pentest"><span class="nav-icon">⚡</span>Pentest</button>
+      <button class="nav-item" data-page="search"><span class="nav-icon">⌕</span>Web Search</button>
+
+      <div class="nav-section-label">// intel</div>
+      <button class="nav-item" data-page="gaming"><span class="nav-icon">▶</span>Gaming News</button>
+      <button class="nav-item" data-page="cybersecurity"><span class="nav-icon">⚔</span>Cyber News</button>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <div id="main">
+    <div id="topbar">
+      <div class="topbar-title" id="topbar-title">// DASHBOARD</div>
+      <div class="topbar-info">
+        <span id="tb-time"></span>
+        <span id="tb-uptime" style="color:var(--text-dim)">uptime: <span style="color:var(--text)">–</span></span>
+        <span id="tb-os" style="color:var(--text-dim)">–</span>
+      </div>
+    </div>
+    <div id="content">
+
+      <!-- ─── DASHBOARD ────────────────────────── -->
+      <div class="page active" id="page-dashboard">
+        <div class="page-header">
+          <div class="page-title">SYSTEM OVERVIEW</div>
+          <div class="page-subtitle">// real-time system metrics</div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">CPU Usage</div>
+            <div><span class="stat-value" id="cpu-val">–</span><span class="stat-unit">%</span></div>
+            <div class="stat-bar"><div class="stat-bar-fill" id="cpu-bar" style="width:0%"></div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Memory</div>
+            <div><span class="stat-value" id="mem-val">–</span><span class="stat-unit">%</span></div>
+            <div class="stat-bar"><div class="stat-bar-fill" id="mem-bar" style="width:0%"></div></div>
+            <div style="font-size:9px;color:var(--text-dim);margin-top:4px" id="mem-detail"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Disk /</div>
+            <div><span class="stat-value" id="disk-val">–</span><span class="stat-unit">%</span></div>
+            <div class="stat-bar"><div class="stat-bar-fill" id="disk-bar" style="width:0%"></div></div>
+            <div style="font-size:9px;color:var(--text-dim);margin-top:4px" id="disk-detail"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Network I/O</div>
+            <div>
+              <span style="font-size:11px;color:var(--accent2)" id="net-rx">↓ – MB</span>&nbsp;
+              <span style="font-size:11px;color:var(--accent4)" id="net-tx">↑ – MB</span>
+            </div>
+            <div style="font-size:9px;color:var(--text-dim);margin-top:8px" id="net-host"></div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title">// top processes</div>
+            <table class="data-table">
+              <thead><tr>
+                <th>PID</th><th>NAME</th><th>CPU%</th><th>MEM%</th><th>STATUS</th>
+              </tr></thead>
+              <tbody id="proc-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="card-title">// system info</div>
+            <table class="data-table">
+              <tbody id="sysinfo-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── SERVICES ─────────────────────────── -->
+      <div class="page" id="page-services">
+        <div class="page-header">
+          <div class="page-title">SERVICE MANAGER</div>
+          <div class="page-subtitle">// systemctl control panel</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// system services</div>
+          <div id="services-list"><div class="loading"><div class="loading-spinner"></div>Loading services…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">// custom service</div>
+          <div class="input-row">
+            <input class="hk-input" id="custom-service" placeholder="service name (e.g. nginx)" style="max-width:300px">
+            <button class="hk-btn" onclick="controlService('custom')">▶ Start</button>
+            <button class="hk-btn red" onclick="controlServiceStop('custom')">■ Stop</button>
+            <button class="hk-btn yellow" onclick="controlServiceRestart('custom')">↺ Restart</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── LOGS ──────────────────────────────── -->
+      <div class="page" id="page-logs">
+        <div class="page-header">
+          <div class="page-title">SYSTEM LOGS</div>
+          <div class="page-subtitle">// /var/log viewer</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// log source</div>
+          <div class="input-row" style="margin-bottom:12px">
+            <select class="hk-select" id="log-file">
+              <option value="/var/log/syslog">syslog</option>
+              <option value="/var/log/auth.log">auth.log</option>
+              <option value="/var/log/kern.log">kern.log</option>
+              <option value="/var/log/dpkg.log">dpkg.log</option>
+            </select>
+            <button class="hk-btn" onclick="loadLogs()">⟳ Refresh</button>
+            <input class="hk-input" id="log-filter" placeholder="filter…" style="max-width:200px" oninput="filterLogs()">
+          </div>
+          <div class="log-container" id="log-output"><div class="loading"><div class="loading-spinner"></div>Loading logs…</div></div>
+        </div>
+      </div>
+
+      <!-- ─── FILES ─────────────────────────────── -->
+      <div class="page" id="page-files">
+        <div class="page-header">
+          <div class="page-title">FILE EXPLORER</div>
+          <div class="page-subtitle">// filesystem browser</div>
+        </div>
+        <div class="card">
+          <div class="breadcrumb" id="file-breadcrumb"></div>
+          <div id="file-list"></div>
+        </div>
+      </div>
+
+      <!-- ─── PACKAGES ──────────────────────────── -->
+      <div class="page" id="page-packages">
+        <div class="page-header">
+          <div class="page-title">PACKAGE MANAGER</div>
+          <div class="page-subtitle">// apt / dpkg interface</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// install / remove</div>
+          <div class="input-row">
+            <input class="hk-input" id="pkg-input" placeholder="package name" style="max-width:300px">
+            <button class="hk-btn" onclick="managePackage('install')">⬇ Install</button>
+            <button class="hk-btn red" onclick="managePackage('remove')">✕ Remove</button>
+          </div>
+          <div id="pkg-result" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">// installed packages</div>
+          <input class="hk-input" id="pkg-filter" placeholder="filter packages…" oninput="filterPackages()" style="margin-bottom:12px">
+          <div style="max-height:400px;overflow-y:auto">
+            <table class="data-table">
+              <thead><tr><th>#</th><th>PACKAGE</th></tr></thead>
+              <tbody id="pkg-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── USERS ─────────────────────────────── -->
+      <div class="page" id="page-users">
+        <div class="page-header">
+          <div class="page-title">USERS &amp; GROUPS</div>
+          <div class="page-subtitle">// identity management</div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title">// system users</div>
+            <div style="max-height:400px;overflow-y:auto">
+              <table class="data-table">
+                <thead><tr><th>USERNAME</th><th>UID</th><th>HOME</th></tr></thead>
+                <tbody id="users-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">// groups</div>
+            <div style="max-height:400px;overflow-y:auto">
+              <table class="data-table">
+                <thead><tr><th>GROUP</th><th>GID</th></tr></thead>
+                <tbody id="groups-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── NETWORK ───────────────────────────── -->
+      <div class="page" id="page-network">
+        <div class="page-header">
+          <div class="page-title">NETWORK MONITOR</div>
+          <div class="page-subtitle">// active connections — ss/netstat</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// active connections</div>
+          <div id="network-content"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
+      </div>
+
+      <!-- ─── PENTEST ────────────────────────────── -->
+      <div class="page" id="page-pentest">
+        <div class="page-header">
+          <div class="page-title">PENETRATION TESTING</div>
+          <div class="page-subtitle">// nmap · nikto — authorized use only</div>
+        </div>
+        <div class="card" style="border-color:rgba(255,51,102,0.3)">
+          <div class="card-title" style="color:var(--accent3)">⚠ WARNING // authorized targets only</div>
+          <p style="font-size:10px;color:var(--text-dim);margin-bottom:16px">Use only on systems you own or have explicit written permission to test.</p>
+          <div class="input-row" style="flex-wrap:wrap;gap:8px">
+            <select class="hk-select" id="pt-tool">
+              <option value="nmap">nmap — Network Scanner</option>
+              <option value="nikto">nikto — Web Vulnerability</option>
+            </select>
+            <input class="hk-input" id="pt-target" placeholder="Target: 192.168.1.1 or example.com" style="flex:1;min-width:200px">
+            <button class="hk-btn red" onclick="runPentest()" id="pt-btn">⚡ Execute</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">// output</div>
+          <pre style="background:#000;padding:12px;border-radius:3px;font-size:11px;color:var(--accent);overflow-x:auto;max-height:450px;overflow-y:auto;white-space:pre-wrap" id="pt-output">// awaiting target...</pre>
+        </div>
+      </div>
+
+      <!-- ─── SEARCH ─────────────────────────────── -->
+      <div class="page" id="page-search">
+        <div class="page-header">
+          <div class="page-title">WEB SEARCH</div>
+          <div class="page-subtitle">// DuckDuckGo proxy</div>
+        </div>
+        <div class="card">
+          <div class="input-row">
+            <input class="hk-input" id="search-q" placeholder="Search query…" onkeydown="if(event.key==='Enter')runSearch()">
+            <button class="hk-btn blue" onclick="runSearch()">⌕ Search</button>
+          </div>
+        </div>
+        <div id="search-results"></div>
+      </div>
+
+      <!-- ─── GAMING NEWS ─────────────────────────── -->
+      <div class="page" id="page-gaming">
+        <div class="page-header">
+          <div class="page-title">GAMING NEWS</div>
+          <div class="page-subtitle">// IGN · GameSpot RSS feeds</div>
+        </div>
+        <div id="gaming-content"><div class="loading"><div class="loading-spinner"></div>Fetching feeds…</div></div>
+      </div>
+
+      <!-- ─── CYBER NEWS ─────────────────────────── -->
+      <div class="page" id="page-cybersecurity">
+        <div class="page-header">
+          <div class="page-title">CYBERSECURITY INTEL</div>
+          <div class="page-subtitle">// The Hacker News · KrebsOnSecurity</div>
+        </div>
+        <div id="cyber-content"><div class="loading"><div class="loading-spinner"></div>Fetching intel…</div></div>
+      </div>
+
+      <!-- ─── DIAGNOSTICS ────────────────────────── -->
+      <div class="page" id="page-diagnostics">
+        <div class="page-header">
+          <div class="page-title">SYSTEM DIAGNOSTICS</div>
+          <div class="page-subtitle">// health check · resource thresholds</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// health status</div>
+          <div class="diag-grid" id="diag-grid"><div class="loading"><div class="loading-spinner"></div>Running checks…</div></div>
+        </div>
+        <div class="card" style="margin-top:0">
+          <div class="card-title">// quick actions</div>
+          <div class="input-row" style="flex-wrap:wrap">
+            <button class="hk-btn" onclick="loadDiagnostics()">⟳ Refresh Checks</button>
+            <button class="hk-btn blue" onclick="runTermCmd('free -h')">Memory Detail</button>
+            <button class="hk-btn blue" onclick="runTermCmd('df -h')">Disk Detail</button>
+            <button class="hk-btn blue" onclick="runTermCmd('ip a')">Network IPs</button>
+          </div>
+          <pre id="diag-cmd-out" style="background:#000;padding:12px;border-radius:3px;font-size:11px;color:var(--accent);margin-top:12px;white-space:pre-wrap;display:none;max-height:300px;overflow-y:auto"></pre>
+        </div>
+      </div>
+
+      <!-- ─── TERMINAL ──────────────────────────── -->
+      <div class="page" id="page-terminal">
+        <div class="page-header">
+          <div class="page-title">WEB TERMINAL</div>
+          <div class="page-subtitle">// remote shell interface</div>
+        </div>
+        <div class="terminal-window">
+          <div class="terminal-titlebar">
+            <div class="terminal-dot" style="background:#ff5f57"></div>
+            <div class="terminal-dot" style="background:#febc2e"></div>
+            <div class="terminal-dot" style="background:#28c840"></div>
+            <span style="margin-left:8px">hackercockpit — bash</span>
+          </div>
+          <div class="terminal-output" id="term-output">
+            <div style="color:var(--accent);margin-bottom:8px">
+              <span style="color:var(--accent2)">HackerCockpit</span> v2.0 — Web Terminal
+            </div>
+            <div style="color:var(--text-dim);font-size:10px;margin-bottom:12px">Type commands below. Use arrow keys for history.</div>
+          </div>
+          <div class="terminal-input-row">
+            <span class="terminal-ps1">root@hackeros:~$</span>
+            <input class="hk-input" id="term-input" placeholder="command…"
+              style="background:transparent;border:none;padding:0;flex:1"
+              onkeydown="handleTermKey(event)">
+            <button class="hk-btn" onclick="runTerminalCommand()" style="padding:4px 12px;font-size:10px">RUN</button>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- #content -->
+  </div><!-- #main -->
+</div><!-- #app -->
+
+<div id="toast"></div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+let currentPage = 'dashboard';
+let termHistory = [];
+let termHistIdx = -1;
+let rawLogs = [];
+let allPackages = [];
+let currentPath = '/';
+let sysData = null;
+
+// ─── Navigation ───────────────────────────────────────────────────────────────
+document.querySelectorAll('.nav-item').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const page = btn.dataset.page;
+    navigate(page);
+  });
+});
+
+function navigate(page) {
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + page)?.classList.add('active');
+  document.getElementById('topbar-title').textContent = '// ' + page.toUpperCase();
+  currentPage = page;
+  onPageLoad(page);
+}
+
+function onPageLoad(page) {
+  if (page === 'dashboard') loadDashboard();
+  else if (page === 'services') loadServices();
+  else if (page === 'logs') loadLogs();
+  else if (page === 'files') loadFiles('/');
+  else if (page === 'packages') loadPackages();
+  else if (page === 'users') loadUsers();
+  else if (page === 'network') loadNetwork();
+  else if (page === 'diagnostics') loadDiagnostics();
+  else if (page === 'gaming') loadNews('gaming');
+  else if (page === 'cybersecurity') loadNews('cybersecurity');
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+function toast(msg, isErr = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.className = '', 3000);
+}
+
+// ─── Clock ────────────────────────────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('tb-time').textContent = new Date().toLocaleTimeString('en-GB', {hour12:false});
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+async function loadDashboard() {
+  try {
+    const r = await fetch('/api/system');
+    const d = await r.json();
+    sysData = d;
+
+    const cpu = parseFloat(d.cpu_usage) || 0;
+    setBar('cpu', cpu);
+
+    const mem = parseInt(d.memory_percent) || 0;
+    setBar('mem', mem);
+    document.getElementById('mem-detail').textContent = `${d.memory_used}MB / ${d.memory_total}MB`;
+
+    const disk = parseInt(d.disk_percent) || 0;
+    setBar('disk', disk);
+    document.getElementById('disk-detail').textContent = `${d.disk_used} / ${d.disk_total}`;
+
+    document.getElementById('net-rx').textContent = `↓ ${d.net_recv} MB`;
+    document.getElementById('net-tx').textContent = `↑ ${d.net_sent} MB`;
+    document.getElementById('net-host').textContent = `host: ${d.hostname}`;
+    document.getElementById('sidebar-hostname').textContent = d.hostname || 'SYSTEM ONLINE';
+    document.getElementById('tb-uptime').innerHTML = `uptime: <span style="color:var(--text)">${d.uptime}</span>`;
+    document.getElementById('tb-os').textContent = d.os || 'HackerOS';
+
+    // Processes
+    const tbody = document.getElementById('proc-tbody');
+    tbody.innerHTML = (d.processes || []).map(p => `
+      <tr>
+        <td class="mono" style="color:var(--text-dim)">${p.pid}</td>
+        <td>${p.name}</td>
+        <td style="color:${parseFloat(p.cpu)>10?'var(--accent4)':'var(--text)'}">${parseFloat(p.cpu).toFixed(1)}</td>
+        <td>${parseFloat(p.mem).toFixed(1)}</td>
+        <td><span class="badge badge-${p.status==='S'?'blue':p.status==='R'?'green':'yellow'}">${p.status||'?'}</span></td>
+      </tr>`).join('');
+
+    // Sysinfo table
+    document.getElementById('sysinfo-tbody').innerHTML = [
+      ['Hostname', d.hostname],
+      ['OS', d.os],
+      ['Kernel', d.kernel],
+      ['Uptime', d.uptime],
+      ['CPU', `${cpu.toFixed(1)}%`],
+      ['Memory', `${mem}%`],
+      ['Disk /', `${disk}%`],
+      ['Net ↓', `${d.net_recv} MB`],
+      ['Net ↑', `${d.net_sent} MB`],
+    ].map(([k,v]) => `<tr><td style="color:var(--text-dim);font-size:10px">${k}</td><td>${v||'–'}</td></tr>`).join('');
+
+  } catch(e) {
+    toast('Failed to load system info', true);
+  }
+}
+
+function setBar(id, pct) {
+  const v = document.getElementById(id+'-val');
+  const b = document.getElementById(id+'-bar');
+  if (v) v.textContent = pct.toFixed(0);
+  if (b) {
+    b.style.width = pct + '%';
+    b.className = 'stat-bar-fill' + (pct > 90 ? ' danger' : pct > 75 ? ' warn' : '');
+  }
+}
+
+// Auto-refresh dashboard
+setInterval(() => { if (currentPage === 'dashboard') loadDashboard(); }, 5000);
+
+// ─── Services ─────────────────────────────────────────────────────────────────
+async function loadServices() {
+  const el = document.getElementById('services-list');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Checking services…</div>';
+  try {
+    const r = await fetch('/api/system');
+    const _ = await r.json(); // just to warm up
+    // We'll call systemctl status per service via terminal endpoint
+    const services = ['ssh','apache2','nginx','docker','mysql','postgresql','redis','fail2ban','cron','ufw'];
+    el.innerHTML = '';
+    for (const svc of services) {
+      const row = document.createElement('div');
+      row.className = 'service-row';
+      row.id = 'svc-' + svc;
+      row.innerHTML = `
+        <div class="service-name">
+          <span style="color:var(--text-dim);font-size:9px;margin-right:6px">●</span>${svc}
+        </div>
+        <div class="service-status" id="svc-status-${svc}"><span class="badge badge-yellow">checking…</span></div>
+        <button class="hk-btn" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','start')">▶</button>
+        <button class="hk-btn red" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','stop')">■</button>
+        <button class="hk-btn yellow" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','restart')">↺</button>
+      `;
+      el.appendChild(row);
+      // Check status async
+      checkSvcStatus(svc);
+    }
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading services</span>';
+  }
+}
+
+async function checkSvcStatus(svc) {
+  try {
+    const r = await fetch('/api/terminal', {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`command=systemctl is-active ${svc} 2>/dev/null`
+    });
+    const d = await r.json();
+    const active = d.output?.trim() === 'active';
+    const el = document.getElementById('svc-status-' + svc);
+    if (el) el.innerHTML = active
+      ? '<span class="badge badge-green">ACTIVE</span>'
+      : '<span class="badge badge-red">INACTIVE</span>';
+  } catch {}
+}
+
+async function svcAction(svc, action) {
+  try {
+    const r = await fetch('/api/services', {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`service_name=${svc}&action=${action}`
+    });
+    const d = await r.json();
+    toast(d.message, d.status !== 'success');
+    setTimeout(() => checkSvcStatus(svc), 1500);
+  } catch(e) {
+    toast('Request failed', true);
+  }
+}
+
+function controlService(id) {
+  const name = id === 'custom' ? document.getElementById('custom-service').value : id;
+  if (!name) return;
+  svcAction(name, 'start');
+}
+function controlServiceStop(id) {
+  const name = id === 'custom' ? document.getElementById('custom-service').value : id;
+  if (!name) return;
+  svcAction(name, 'stop');
+}
+function controlServiceRestart(id) {
+  const name = id === 'custom' ? document.getElementById('custom-service').value : id;
+  if (!name) return;
+  svcAction(name, 'restart');
+}
+
+// ─── Logs ─────────────────────────────────────────────────────────────────────
+async function loadLogs() {
+  const logFile = document.getElementById('log-file').value;
+  const out = document.getElementById('log-output');
+  out.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch(`/api/logs?file=${encodeURIComponent(logFile)}`);
+    const d = await r.json();
+    rawLogs = d.logs || [];
+    renderLogs(rawLogs);
+    out.scrollTop = out.scrollHeight;
+  } catch {
+    out.innerHTML = '<span style="color:var(--accent3)">Error loading logs</span>';
+  }
+}
+
+function renderLogs(lines) {
+  const out = document.getElementById('log-output');
+  out.innerHTML = lines.map(l => {
+    const cls = /error|fail|crit/i.test(l) ? 'err' : /warn/i.test(l) ? 'warn' : /info/i.test(l) ? 'info' : '';
+    return `<div class="log-line ${cls}">${escHtml(l)}</div>`;
+  }).join('');
+}
+
+function filterLogs() {
+  const q = document.getElementById('log-filter').value.toLowerCase();
+  renderLogs(q ? rawLogs.filter(l => l.toLowerCase().includes(q)) : rawLogs);
+}
+
+// ─── Files ────────────────────────────────────────────────────────────────────
+async function loadFiles(path) {
+  currentPath = path;
+  const r = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+  const d = await r.json();
+
+  // Breadcrumb
+  const parts = path === '/' ? [''] : path.split('/');
+  const bc = document.getElementById('file-breadcrumb');
+  bc.innerHTML = '';
+  let built = '';
+  parts.forEach((p, i) => {
+    if (i > 0) bc.innerHTML += '<span class="breadcrumb-sep">/</span>';
+    built += (i === 0 ? '/' : p + '/');
+    const seg = built;
+    const span = document.createElement('span');
+    span.className = 'breadcrumb-item';
+    span.textContent = i === 0 ? '/' : p;
+    span.onclick = () => loadFiles(seg.replace(/\/+$/, '') || '/');
+    bc.appendChild(span);
+  });
+
+  // Files
+  const fl = document.getElementById('file-list');
+  if (!d.files || d.files.length === 0) { fl.innerHTML = '<span style="color:var(--text-dim);font-size:11px">empty directory</span>'; return; }
+
+  const sorted = [...d.files].sort((a,b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name));
+  fl.innerHTML = sorted.map(f => `
+    <div class="file-row" onclick="${f.isDir ? `loadFiles('${path === '/' ? '' : path}/${f.name}')` : ''}">
+      <div class="file-icon">${f.isDir ? '📁' : getFileIcon(f.name)}</div>
+      <div class="file-name" style="color:${f.isDir?'var(--accent2)':'var(--text)'}">${escHtml(f.name)}</div>
+      <div class="file-size">${f.size}</div>
+      <div class="file-date">${f.modified}</div>
+    </div>`).join('');
+}
+
+function getFileIcon(name) {
+  const ext = name.split('.').pop()?.toLowerCase();
+  const icons = {sh:'📜',py:'🐍',js:'📜',ts:'📜',html:'🌐',css:'🎨',json:'{}',md:'📝',txt:'📄',log:'📋',gz:'📦',tar:'📦',zip:'📦',conf:'⚙',cfg:'⚙',png:'🖼',jpg:'🖼',svg:'🖼'};
+  return icons[ext] || '📄';
+}
+
+// ─── Packages ─────────────────────────────────────────────────────────────────
+async function loadPackages() {
+  const r = await fetch('/api/system');
+  // Load packages via terminal
+  const pr = await fetch('/api/terminal', {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`command=dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | head -200`
+  });
+  const pd = await pr.json();
+  allPackages = (pd.output || '').split('\n').filter(Boolean);
+  renderPackages(allPackages);
+}
+
+function renderPackages(pkgs) {
+  document.getElementById('pkg-tbody').innerHTML = pkgs.map((p, i) =>
+    `<tr><td style="color:var(--text-muted)">${i+1}</td><td class="mono">${escHtml(p)}</td></tr>`
+  ).join('');
+}
+
+function filterPackages() {
+  const q = document.getElementById('pkg-filter').value.toLowerCase();
+  renderPackages(q ? allPackages.filter(p => p.toLowerCase().includes(q)) : allPackages);
+}
+
+async function managePackage(action) {
+  const name = document.getElementById('pkg-input').value.trim();
+  if (!name) return;
+  const el = document.getElementById('pkg-result');
+  el.textContent = `Running ${action} for ${name}…`;
+  try {
+    const r = await fetch('/api/packages', {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`package_name=${encodeURIComponent(name)}&action=${action}`
+    });
+    const d = await r.json();
+    el.textContent = d.message;
+    el.style.color = d.status === 'success' ? 'var(--accent)' : 'var(--accent3)';
+    toast(d.message, d.status !== 'success');
+  } catch {
+    el.textContent = 'Request failed';
+    el.style.color = 'var(--accent3)';
+  }
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+async function loadUsers() {
+  try {
+    const [ur, gr] = await Promise.all([
+      fetch('/api/terminal', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'command=getent passwd | awk -F: \'{print $1" "$3" "$6}\'' }),
+      fetch('/api/terminal', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'command=getent group | awk -F: \'{print $1" "$3}\'' }),
+    ]);
+    const ud = await ur.json();
+    const gd = await gr.json();
+    const users = (ud.output||'').split('\n').filter(Boolean).map(l => {
+      const [username,uid,home] = l.split(' ');
+      return {username,uid,home};
+    });
+    const groups = (gd.output||'').split('\n').filter(Boolean).map(l => {
+      const [groupname,gid] = l.split(' ');
+      return {groupname,gid};
+    });
+    document.getElementById('users-tbody').innerHTML = users.map(u =>
+      `<tr><td>${escHtml(u.username||'')}</td><td style="color:var(--text-dim)">${u.uid}</td><td style="color:var(--text-dim);font-size:10px">${escHtml(u.home||'')}</td></tr>`
+    ).join('');
+    document.getElementById('groups-tbody').innerHTML = groups.map(g =>
+      `<tr><td>${escHtml(g.groupname||'')}</td><td style="color:var(--text-dim)">${g.gid}</td></tr>`
+    ).join('');
+  } catch {}
+}
+
+// ─── Network ─────────────────────────────────────────────────────────────────
+async function loadNetwork() {
+  const el = document.getElementById('network-content');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/network');
+    const d = await r.json();
+    const conns = d.connections || [];
+    if (!conns.length) { el.innerHTML = '<span style="color:var(--text-dim)">No active connections</span>'; return; }
+    el.innerHTML = `<table class="data-table">
+      <thead><tr><th>PROTO</th><th>LOCAL</th><th>REMOTE</th><th>STATUS</th></tr></thead>
+      <tbody>${conns.map(c => `<tr>
+        <td><span class="badge badge-blue">${c.proto||'?'}</span></td>
+        <td class="mono" style="color:var(--accent2)">${escHtml(c.local||'')}</td>
+        <td class="mono">${escHtml(c.remote||'')}</td>
+        <td><span class="badge badge-${c.status==='ESTABLISHED'?'green':'yellow'}">${escHtml(c.status||'')}</span></td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading network data</span>';
+  }
+}
+
+// ─── Diagnostics ──────────────────────────────────────────────────────────────
+async function loadDiagnostics() {
+  const el = document.getElementById('diag-grid');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Running checks…</div>';
+  try {
+    const r = await fetch('/api/diagnostics');
+    const d = await r.json();
+    el.innerHTML = [
+      { icon:'💾', name:'DISK', val:d.disk_pct+'%', ok:d.disk_ok, sub:`Used — threshold <90%` },
+      { icon:'🧠', name:'MEMORY', val:d.memory_pct+'%', ok:d.memory_ok, sub:`RAM — threshold <90%` },
+      { icon:'⚡', name:'CPU LOAD', val:d.cpu_load, ok:d.cpu_ok, sub:`Load avg — threshold <4.0` },
+      { icon:'🌐', name:'DNS', val:d.dns_ok?'OK':'FAIL', ok:d.dns_ok, sub:`8.8.8.8 resolver` },
+      { icon:'🔗', name:'NETWORK', val:d.network_ok?'OK':'FAIL', ok:d.network_ok, sub:`Ping 8.8.8.8` },
+    ].map(c => `
+      <div class="diag-card">
+        <div class="diag-icon">${c.icon}</div>
+        <div class="diag-name">${c.name}</div>
+        <div class="diag-value ${c.ok?'ok':'err'}">${c.val}</div>
+        <div class="diag-sub">${c.sub}</div>
+        <div style="margin-top:8px"><span class="badge badge-${c.ok?'green':'red'}">${c.ok?'HEALTHY':'WARNING'}</span></div>
+      </div>
+    `).join('');
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Diagnostics failed</span>';
+  }
+}
+
+async function runTermCmd(cmd) {
+  const el = document.getElementById('diag-cmd-out');
+  el.style.display = 'block';
+  el.textContent = 'Running…';
+  const r = await fetch('/api/terminal', {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`command=${encodeURIComponent(cmd)}`
+  });
+  const d = await r.json();
+  el.textContent = d.output || d.message || '';
+}
+
+// ─── Pentest ──────────────────────────────────────────────────────────────────
+async function runPentest() {
+  const tool = document.getElementById('pt-tool').value;
+  const target = document.getElementById('pt-target').value.trim();
+  if (!target) { toast('Enter a target', true); return; }
+  const out = document.getElementById('pt-output');
+  const btn = document.getElementById('pt-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  out.textContent = `// Running ${tool} on ${target}…\n// This may take a while…`;
+  try {
+    const r = await fetch('/api/pentest', {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`tool=${tool}&target=${encodeURIComponent(target)}`
+    });
+    const d = await r.json();
+    out.textContent = d.result || d.message || 'No output';
+  } catch(e) {
+    out.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = '⚡ Execute';
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+async function runSearch() {
+  const q = document.getElementById('search-q').value.trim();
+  if (!q) return;
+  const el = document.getElementById('search-results');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Searching…</div>';
+  // Open DuckDuckGo in new tab as fallback (web scraping blocked in most envs)
+  window.open(`https://duckduckgo.com/?q=${encodeURIComponent(q)}`, '_blank');
+  el.innerHTML = `<div class="card"><div class="card-title">// search opened</div>
+    <p style="font-size:11px;color:var(--text-dim)">Search for <span style="color:var(--accent)">${escHtml(q)}</span> opened in new tab via DuckDuckGo.</p></div>`;
+}
+
+// ─── News ─────────────────────────────────────────────────────────────────────
+async function loadNews(type) {
+  const el = document.getElementById(type === 'gaming' ? 'gaming-content' : 'cyber-content');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Fetching feeds…</div>';
+  try {
+    const r = await fetch(`/api/news/${type}`);
+    const d = await r.json();
+    const news = d.news || [];
+    if (!news.length) {
+      el.innerHTML = '<div class="card"><span style="color:var(--text-dim)">No articles found. RSS feeds may be unavailable.</span></div>';
+      return;
+    }
+    el.innerHTML = `<div class="news-grid">${news.map(a => `
+      <div class="news-item">
+        <div class="news-title"><a href="${escHtml(a.link)}" target="_blank" rel="noopener">${escHtml(a.title)}</a></div>
+        <div class="news-summary">${escHtml(a.summary.slice(0, 180))}${a.summary.length > 180 ? '…' : ''}</div>
+      </div>`).join('')}</div>`;
+  } catch {
+    el.innerHTML = '<div class="card"><span style="color:var(--accent3)">Failed to load feeds</span></div>';
+  }
+}
+
+// ─── Terminal ─────────────────────────────────────────────────────────────────
+function handleTermKey(e) {
+  if (e.key === 'Enter') runTerminalCommand();
+  else if (e.key === 'ArrowUp') {
+    if (termHistIdx < termHistory.length - 1) termHistIdx++;
+    document.getElementById('term-input').value = termHistory[termHistory.length - 1 - termHistIdx] || '';
+  } else if (e.key === 'ArrowDown') {
+    if (termHistIdx > 0) termHistIdx--;
+    else { termHistIdx = -1; document.getElementById('term-input').value = ''; return; }
+    document.getElementById('term-input').value = termHistory[termHistory.length - 1 - termHistIdx] || '';
+  }
+}
+
+async function runTerminalCommand() {
+  const inp = document.getElementById('term-input');
+  const cmd = inp.value.trim();
+  if (!cmd) return;
+  termHistory.push(cmd);
+  termHistIdx = -1;
+  inp.value = '';
+
+  const out = document.getElementById('term-output');
+  const cmdLine = document.createElement('div');
+  cmdLine.className = 'terminal-line';
+  cmdLine.innerHTML = `<span class="terminal-prompt">root@hackeros:~$</span><span class="terminal-cmd">${escHtml(cmd)}</span>`;
+  out.appendChild(cmdLine);
+
+  try {
+    const r = await fetch('/api/terminal', {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`command=${encodeURIComponent(cmd)}`
+    });
+    const d = await r.json();
+    const resultEl = document.createElement('div');
+    resultEl.className = d.status === 'error' ? 'terminal-error' : 'terminal-result';
+    resultEl.textContent = d.output || d.message || '';
+    out.appendChild(resultEl);
+  } catch(e) {
+    const errEl = document.createElement('div');
+    errEl.className = 'terminal-error';
+    errEl.textContent = 'Error: ' + e.message;
+    out.appendChild(errEl);
+  }
+  out.scrollTop = out.scrollHeight;
+}
+
+// ─── Utils ────────────────────────────────────────────────────────────────────
+function escHtml(str) {
+  return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+loadDashboard();
+</script>
+</body>
+</html>
