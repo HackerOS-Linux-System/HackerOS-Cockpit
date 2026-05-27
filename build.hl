@@ -1,1 +1,187 @@
+#!/usr/bin/hl
 
+using <gen 2>
+
+# <main/colors>
+# <main/sys>
+
+;; ─── Konfiguracja projektu ───────────────────────────────────────────────────
+% BIT_BUILD_TARGET = elf
+% BIT_BUILD_INPUT  = source-code/server.ts
+
+% PROJECT    : str = HackerCockpit
+% VERSION    : str = 2.0.0
+% OUT_BIN    : str = hacker-cockpit
+% OUT_DIR    : str = dist
+% PORT       : int = 4545
+
+;; ─── Baner startowy ─────────────────────────────────────────────────────────
+::hr 60
+~> @COLOR_BOLD@COLOR_GREEN  ██╗  ██╗ █████╗  ██████╗██╗  ██╗███████╗██████╗ @COLOR_RESET
+~> @COLOR_BOLD@COLOR_GREEN  ██║  ██║██╔══██╗██╔════╝██║ ██╔╝██╔════╝██╔══██╗@COLOR_RESET
+~> @COLOR_BOLD@COLOR_GREEN  ███████║███████║██║     █████╔╝ █████╗  ██████╔╝@COLOR_RESET
+~> @COLOR_BOLD@COLOR_GREEN  ██╔══██║██╔══██║██║     ██╔═██╗ ██╔══╝  ██╔══██╗@COLOR_RESET
+~> @COLOR_BOLD@COLOR_GREEN  ██║  ██║██║  ██║╚██████╗██║  ██╗███████╗██║  ██║@COLOR_RESET
+~> @COLOR_BOLD@COLOR_GREEN  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝@COLOR_RESET
+~>
+~>   @COLOR_CYAN@PROJECT@COLOR_RESET v@VERSION  — @COLOR_DIM Build Script @COLOR_RESET
+~>   @COLOR_DIM Target: Debian/HackerOS x86_64 · Port: @PORT@COLOR_RESET
+::hr 60
+~>
+
+;; ─── Sprawdź wymagania ───────────────────────────────────────────────────────
+~> @COLOR_YELLOW[1/6]@COLOR_RESET Sprawdzanie wymagań systemowych...
+
+::which bun
+? ok
+    ::green   ✓ bun — znaleziono
+? err
+    ::red     ✗ bun nie znaleziono!
+    ~> @COLOR_RED  Zainstaluj Bun: curl -fsSL https://bun.sh/install | bash@COLOR_RESET
+    ~> Przerwanie buildu.
+    > exit 1
+done
+
+::which node
+? ok
+    ::green   ✓ node — znaleziono
+? err
+    ::yellow  ⚠ node nie znaleziono — tylko Bun runtime
+done
+
+> bun --version |> @BUN_VERSION
+~> @COLOR_DIM  Bun: @BUN_VERSION@COLOR_RESET
+
+;; ─── Sprawdź pliki źródłowe ──────────────────────────────────────────────────
+~> @COLOR_YELLOW[2/6]@COLOR_RESET Weryfikacja struktury projektu...
+
+::isfile source-code/server.ts
+? ok
+    ::green   ✓ source-code/server.ts
+? err
+    ::red     ✗ Brak pliku: source-code/server.ts
+    > exit 1
+done
+
+::isfile templates/app.html
+? ok
+    ::green   ✓ templates/app.html
+? err
+    ::red     ✗ Brak pliku: templates/app.html
+    > exit 1
+done
+
+::isfile package.json
+? ok
+    ::green   ✓ package.json
+? err
+    ::red     ✗ Brak pliku: package.json
+    > exit 1
+done
+
+;; ─── Przygotuj katalog dist ──────────────────────────────────────────────────
+~> @COLOR_YELLOW[3/6]@COLOR_RESET Przygotowanie katalogu dist/...
+
+::isdir @OUT_DIR
+? ok
+    ::yellow  ⚠ Katalog dist/ istnieje — czyszczenie...
+    > rm -rf @OUT_DIR
+done
+
+> mkdir -p @OUT_DIR/templates
+> mkdir -p @OUT_DIR/public
+
+::green   ✓ Katalogi dist/ utworzone
+
+;; ─── Kopiuj zasoby ───────────────────────────────────────────────────────────
+~> @COLOR_YELLOW[4/6]@COLOR_RESET Kopiowanie zasobów statycznych...
+
+> cp -r templates/* @OUT_DIR/templates/
+? ok
+    ::green   ✓ templates/ skopiowane
+? err
+    ::yellow  ⚠ Brak szablonów do skopiowania
+done
+
+::isdir public
+? ok
+    > cp -r public/* @OUT_DIR/public/
+    ::green   ✓ public/ skopiowane
+? err
+    ::yellow  ⚠ Katalog public/ nie istnieje — pomijam
+done
+
+;; ─── Kompilacja binarki ──────────────────────────────────────────────────────
+~> @COLOR_YELLOW[5/6]@COLOR_RESET Kompilacja binarki z Bun...
+~> @COLOR_DIM  bun build --compile --target=bun-linux-x64 source-code/server.ts --outfile @OUT_DIR/@OUT_BIN@COLOR_RESET
+
+> bun build --compile --target=bun-linux-x64 --minify source-code/server.ts --outfile @OUT_DIR/@OUT_BIN
+? ok
+    ::green   ✓ Kompilacja zakończona sukcesem!
+? err
+    ::red     ✗ Błąd kompilacji!
+    ~> @COLOR_RED  Sprawdź błędy powyżej.@COLOR_RESET
+    > exit 1
+done
+
+;; ─── Uprawnienia i weryfikacja ───────────────────────────────────────────────
+~> @COLOR_YELLOW[6/6]@COLOR_RESET Finalizacja i weryfikacja...
+
+> chmod +x @OUT_DIR/@OUT_BIN
+
+> du -sh @OUT_DIR/@OUT_BIN |> @BIN_SIZE
+::green   ✓ Binarka: @OUT_DIR/@OUT_BIN  (@BIN_SIZE)
+
+> file @OUT_DIR/@OUT_BIN |> @FILE_INFO
+~> @COLOR_DIM  @FILE_INFO@COLOR_RESET
+
+;; ─── Zapis metadanych buildu ─────────────────────────────────────────────────
+> date +%Y-%m-%dT%H:%M:%S |> @BUILD_TIME
+> uname -m |> @ARCH
+> uname -r  |> @KERNEL
+
+*> cat > @OUT_DIR/BUILD_INFO << EOF
+PROJECT=HackerCockpit
+VERSION=2.0.0
+BUILD_TIME=@BUILD_TIME
+ARCH=@ARCH
+KERNEL=@KERNEL
+BUN_VERSION=@BUN_VERSION
+TARGET=bun-linux-x64
+BINARY=@OUT_BIN
+PORT=4545
+EOF
+
+::green   ✓ BUILD_INFO zapisane
+
+;; ─── Utwórz skrypt uruchomieniowy ───────────────────────────────────────────
+*> cat > @OUT_DIR/start.sh << 'EOF'
+#!/bin/bash
+# HackerCockpit — start script
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export HACKER_COCKPIT_DIR="$DIR"
+cd "$DIR"
+echo "[HackerCockpit] Starting on port 4545..."
+exec ./hacker-cockpit
+EOF
+
+> chmod +x @OUT_DIR/start.sh
+::green   ✓ start.sh utworzony
+
+;; ─── Podsumowanie buildu ─────────────────────────────────────────────────────
+::hr 60
+::bold BUILD ZAKOŃCZONY SUKCESEM
+::hr 60
+~>
+~> @COLOR_GREEN  Binarka:   @OUT_DIR/@OUT_BIN@COLOR_RESET
+~> @COLOR_GREEN  Rozmiar:   @BIN_SIZE@COLOR_RESET
+~> @COLOR_CYAN   Port:      @PORT@COLOR_RESET
+~> @COLOR_DIM    Build:     @BUILD_TIME@COLOR_RESET
+~>
+~> @COLOR_BOLD Uruchomienie:@COLOR_RESET
+~>   @COLOR_CYAN./@OUT_DIR/start.sh@COLOR_RESET
+~>   lub: @COLOR_CYAN./@OUT_DIR/@OUT_BIN@COLOR_RESET
+~>
+~>   Panel dostępny: @COLOR_GREEN http://0.0.0.0:@PORT @COLOR_RESET
+::hr 60
+~>
