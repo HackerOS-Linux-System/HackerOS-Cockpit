@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HackerCockpit // login</title>
+<style>
+  :root {
+    --bg: #0a0e14; --bg2: #0d1520; --bg3: #111a26; --border: #1e2d3d;
+    --accent: #00ff9d; --accent3: #ff3366; --text: #c8d3de; --text-dim: #5a6b7d;
+    --font-mono: 'JetBrains Mono','Fira Code',monospace; --font-ui: 'Inter',system-ui,sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 0%, #0d1826, var(--bg));
+    font-family: var(--font-ui); color: var(--text);
+  }
+  .box {
+    width: 320px; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 28px; box-shadow: 0 0 40px rgba(0,255,157,0.06);
+  }
+  .logo { font-family: var(--font-mono); font-size: 18px; letter-spacing: 2px; color: var(--text); margin-bottom: 2px; }
+  .logo span { color: var(--accent); }
+  .sub { font-size: 10px; color: var(--text-dim); letter-spacing: 2px; margin-bottom: 24px; }
+  label { display:block; font-size: 9px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px; margin-top: 14px; }
+  input {
+    width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 3px;
+    color: var(--text); padding: 9px 12px; font-family: var(--font-mono); font-size: 13px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    width: 100%; margin-top: 20px; background: transparent; border: 1px solid var(--accent);
+    color: var(--accent); padding: 10px; font-family: var(--font-ui); font-size: 11px;
+    letter-spacing: 1px; border-radius: 3px; cursor: pointer;
+  }
+  button:hover { background: rgba(0,255,157,0.1); }
+  #err { color: var(--accent3); font-size: 11px; margin-top: 12px; min-height: 14px; }
+</style>
+</head>
+<body>
+  <form class="box" id="login-form">
+    <div class="logo">HACKER<span>COCKPIT</span></div>
+    <div class="sub">// v0.3 — restricted access</div>
+    <label>USERNAME</label>
+    <input id="username" name="username" autocomplete="username" autofocus>
+    <label>PASSWORD</label>
+    <input id="password" name="password" type="password" autocomplete="current-password">
+    <button type="submit">▶ AUTHENTICATE</button>
+    <div id="err"></div>
+  </form>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const errEl = document.getElementById('err');
+  errEl.textContent = '';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
+    });
+    if (r.ok) { window.location.href = '/'; return; }
+    const d = await r.json().catch(() => ({}));
+    errEl.textContent = d.message || 'Invalid credentials';
+  } catch {
+    errEl.textContent = 'Login request failed';
+  }
+});
+</script>
+</body>
+</html>
