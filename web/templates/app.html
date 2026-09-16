@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>HackerCockpit // v2</title>
+  <title>HackerCockpit // v0.3</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet">
   <style>
@@ -444,11 +444,16 @@
   <nav id="sidebar">
     <div class="sidebar-header">
       <div class="sidebar-logo">HACKER<span>COCKPIT</span></div>
-      <div class="sidebar-version">// v2.0 — HackerOS</div>
+      <div class="sidebar-version">// v0.3 — HackerOS</div>
     </div>
     <div class="sidebar-status">
       <div class="status-dot"></div>
       <span id="sidebar-hostname">SYSTEM ONLINE</span>
+    </div>
+    <div class="sidebar-status" id="sidebar-auth-row" style="display:none">
+      <span style="color:var(--accent2)">◉</span>
+      <span id="sidebar-username" style="flex:1"></span>
+      <button class="nav-item" style="width:auto;padding:2px 8px;font-size:9px" onclick="doLogout()">LOGOUT</button>
     </div>
     <div class="sidebar-nav">
       <div class="nav-section-label">// system</div>
@@ -456,6 +461,7 @@
       <button class="nav-item" data-page="services"><span class="nav-icon">⚙</span>Services</button>
       <button class="nav-item" data-page="logs"><span class="nav-icon">▤</span>Logs</button>
       <button class="nav-item" data-page="diagnostics"><span class="nav-icon">◈</span>Diagnostics</button>
+      <button class="nav-item" data-page="audit"><span class="nav-icon">▥</span>Audit Log</button>
 
       <div class="nav-section-label">// tools</div>
       <button class="nav-item" data-page="terminal"><span class="nav-icon">$</span>Terminal</button>
@@ -463,6 +469,9 @@
       <button class="nav-item" data-page="packages"><span class="nav-icon">⬡</span>Packages</button>
       <button class="nav-item" data-page="users"><span class="nav-icon">◉</span>Users &amp; Groups</button>
       <button class="nav-item" data-page="network"><span class="nav-icon">◎</span>Network</button>
+      <button class="nav-item" data-page="firewall"><span class="nav-icon">▲</span>Firewall</button>
+      <button class="nav-item" data-page="cron"><span class="nav-icon">◷</span>Scheduler</button>
+      <button class="nav-item" data-page="containers"><span class="nav-icon">▣</span>Containers</button>
       <button class="nav-item" data-page="pentest"><span class="nav-icon">⚡</span>Pentest</button>
       <button class="nav-item" data-page="search"><span class="nav-icon">⌕</span>Web Search</button>
 
@@ -589,6 +598,10 @@
           <div class="breadcrumb" id="file-breadcrumb"></div>
           <div id="file-list"></div>
         </div>
+        <div class="card" id="file-preview-card" style="display:none">
+          <div class="card-title">// preview: <span id="file-preview-name" style="color:var(--text)"></span></div>
+          <pre id="file-preview-content" style="background:#000;padding:12px;border-radius:3px;font-size:11px;color:var(--text);max-height:400px;overflow:auto;white-space:pre-wrap"></pre>
+        </div>
       </div>
 
       <!-- ─── PACKAGES ──────────────────────────── -->
@@ -656,6 +669,80 @@
           <div class="card-title">// active connections</div>
           <div id="network-content"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
         </div>
+        <div class="card">
+          <div class="card-title">// interfaces</div>
+          <div id="iface-content"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
+      </div>
+
+      <!-- ─── FIREWALL ───────────────────────────── -->
+      <div class="page" id="page-firewall">
+        <div class="page-header">
+          <div class="page-title">FIREWALL</div>
+          <div class="page-subtitle">// ufw — uncomplicated firewall</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// status</div>
+          <div id="fw-status"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">// rules</div>
+          <div class="input-row" style="margin-bottom:12px">
+            <input class="hk-input" id="fw-rule-input" placeholder="e.g. 22/tcp, 443, 192.168.1.0/24" style="max-width:300px">
+            <button class="hk-btn" onclick="fwAddRule()">＋ Allow</button>
+            <button class="hk-btn" onclick="loadFirewall()">⟳ Refresh</button>
+          </div>
+          <div id="fw-rules"></div>
+        </div>
+      </div>
+
+      <!-- ─── SCHEDULER (cron) ───────────────────── -->
+      <div class="page" id="page-cron">
+        <div class="page-header">
+          <div class="page-title">TASK SCHEDULER</div>
+          <div class="page-subtitle">// crontab — root user</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// new job</div>
+          <div class="input-row">
+            <input class="hk-input" id="cron-input" placeholder="* * * * * /path/to/script.sh" style="flex:1">
+            <button class="hk-btn" onclick="cronAdd()">＋ Add</button>
+          </div>
+          <p style="font-size:9px;color:var(--text-dim);margin-top:8px">Standard 5-field cron syntax followed by the command to run.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">// scheduled jobs</div>
+          <div id="cron-list"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
+      </div>
+
+      <!-- ─── CONTAINERS ─────────────────────────── -->
+      <div class="page" id="page-containers">
+        <div class="page-header">
+          <div class="page-title">CONTAINERS</div>
+          <div class="page-subtitle">// docker / podman manager</div>
+        </div>
+        <div class="card">
+          <div class="card-title">// containers</div>
+          <div class="input-row" style="margin-bottom:12px"><button class="hk-btn" onclick="loadContainers()">⟳ Refresh</button></div>
+          <div id="container-list"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">// logs</div>
+          <pre id="container-logs" style="background:#000;padding:12px;border-radius:3px;font-size:11px;color:var(--accent);max-height:350px;overflow-y:auto;white-space:pre-wrap">// select a container to view logs</pre>
+        </div>
+      </div>
+
+      <!-- ─── AUDIT LOG ──────────────────────────── -->
+      <div class="page" id="page-audit">
+        <div class="page-header">
+          <div class="page-title">AUDIT LOG</div>
+          <div class="page-subtitle">// record of sensitive actions performed via this panel</div>
+        </div>
+        <div class="card">
+          <div class="input-row" style="margin-bottom:12px"><button class="hk-btn" onclick="loadAudit()">⟳ Refresh</button></div>
+          <div class="log-container" id="audit-output"><div class="loading"><div class="loading-spinner"></div>Loading…</div></div>
+        </div>
       </div>
 
       <!-- ─── PENTEST ────────────────────────────── -->
@@ -671,6 +758,7 @@
             <select class="hk-select" id="pt-tool">
               <option value="nmap">nmap — Network Scanner</option>
               <option value="nikto">nikto — Web Vulnerability</option>
+              <option value="whois">whois — Domain/IP Lookup</option>
             </select>
             <input class="hk-input" id="pt-target" placeholder="Target: 192.168.1.1 or example.com" style="flex:1;min-width:200px">
             <button class="hk-btn red" onclick="runPentest()" id="pt-btn">⚡ Execute</button>
@@ -686,7 +774,7 @@
       <div class="page" id="page-search">
         <div class="page-header">
           <div class="page-title">WEB SEARCH</div>
-          <div class="page-subtitle">// DuckDuckGo proxy</div>
+          <div class="page-subtitle">// DuckDuckGo results, fetched server-side</div>
         </div>
         <div class="card">
           <div class="input-row">
@@ -752,7 +840,7 @@
           </div>
           <div class="terminal-output" id="term-output">
             <div style="color:var(--accent);margin-bottom:8px">
-              <span style="color:var(--accent2)">HackerCockpit</span> v2.0 — Web Terminal
+              <span style="color:var(--accent2)">HackerCockpit</span> v0.3 — Web Terminal (Go edition)
             </div>
             <div style="color:var(--text-dim);font-size:10px;margin-bottom:12px">Type commands below. Use arrow keys for history.</div>
           </div>
@@ -782,6 +870,14 @@ let allPackages = [];
 let currentPath = '/';
 let sysData = null;
 
+// v0.3: if auth is enabled and the session expires mid-use, bounce to /login
+const _origFetch = window.fetch;
+window.fetch = async function(...args) {
+  const resp = await _origFetch(...args);
+  if (resp.status === 401) { window.location.href = '/login'; }
+  return resp;
+};
+
 // ─── Navigation ───────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-item').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -803,14 +899,35 @@ function onPageLoad(page) {
   if (page === 'dashboard') loadDashboard();
   else if (page === 'services') loadServices();
   else if (page === 'logs') loadLogs();
-  else if (page === 'files') loadFiles('/');
+  else if (page === 'files') loadFiles(currentPath || '/');
   else if (page === 'packages') loadPackages();
   else if (page === 'users') loadUsers();
-  else if (page === 'network') loadNetwork();
+  else if (page === 'network') { loadNetwork(); loadInterfaces(); }
+  else if (page === 'firewall') loadFirewall();
+  else if (page === 'cron') loadCron();
+  else if (page === 'containers') loadContainers();
+  else if (page === 'audit') loadAudit();
   else if (page === 'diagnostics') loadDiagnostics();
   else if (page === 'gaming') loadNews('gaming');
   else if (page === 'cybersecurity') loadNews('cybersecurity');
 }
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/me');
+    const d = await r.json();
+    if (d.auth_enabled && d.username) {
+      document.getElementById('sidebar-auth-row').style.display = 'flex';
+      document.getElementById('sidebar-username').textContent = d.username;
+    }
+  } catch {}
+}
+async function doLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+checkAuth();
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
 function toast(msg, isErr = false) {
@@ -900,12 +1017,13 @@ async function loadServices() {
   const el = document.getElementById('services-list');
   el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Checking services…</div>';
   try {
-    const r = await fetch('/api/system');
-    const _ = await r.json(); // just to warm up
-    // We'll call systemctl status per service via terminal endpoint
-    const services = ['ssh','apache2','nginx','docker','mysql','postgresql','redis','fail2ban','cron','ufw'];
+    const r = await fetch('/api/services');
+    const d = await r.json();
+    const statuses = d.services || {};
+    const services = Object.keys(statuses).length ? Object.keys(statuses) : ['ssh','apache2','nginx','docker','mysql','postgresql','redis','fail2ban','cron','ufw'];
     el.innerHTML = '';
     for (const svc of services) {
+      const active = !!statuses[svc];
       const row = document.createElement('div');
       row.className = 'service-row';
       row.id = 'svc-' + svc;
@@ -913,14 +1031,12 @@ async function loadServices() {
         <div class="service-name">
           <span style="color:var(--text-dim);font-size:9px;margin-right:6px">●</span>${svc}
         </div>
-        <div class="service-status" id="svc-status-${svc}"><span class="badge badge-yellow">checking…</span></div>
+        <div class="service-status" id="svc-status-${svc}">${active ? '<span class="badge badge-green">ACTIVE</span>' : '<span class="badge badge-red">INACTIVE</span>'}</div>
         <button class="hk-btn" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','start')">▶</button>
         <button class="hk-btn red" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','stop')">■</button>
         <button class="hk-btn yellow" style="padding:4px 10px;font-size:10px" onclick="svcAction('${svc}','restart')">↺</button>
       `;
       el.appendChild(row);
-      // Check status async
-      checkSvcStatus(svc);
     }
   } catch(e) {
     el.innerHTML = '<span style="color:var(--accent3)">Error loading services</span>';
@@ -929,12 +1045,9 @@ async function loadServices() {
 
 async function checkSvcStatus(svc) {
   try {
-    const r = await fetch('/api/terminal', {
-      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:`command=systemctl is-active ${svc} 2>/dev/null`
-    });
+    const r = await fetch('/api/services');
     const d = await r.json();
-    const active = d.output?.trim() === 'active';
+    const active = !!(d.services || {})[svc];
     const el = document.getElementById('svc-status-' + svc);
     if (el) el.innerHTML = active
       ? '<span class="badge badge-green">ACTIVE</span>'
@@ -1028,13 +1141,36 @@ async function loadFiles(path) {
   if (!d.files || d.files.length === 0) { fl.innerHTML = '<span style="color:var(--text-dim);font-size:11px">empty directory</span>'; return; }
 
   const sorted = [...d.files].sort((a,b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name));
-  fl.innerHTML = sorted.map(f => `
-    <div class="file-row" onclick="${f.isDir ? `loadFiles('${path === '/' ? '' : path}/${f.name}')` : ''}">
+  fl.innerHTML = sorted.map(f => {
+    const full = (path === '/' ? '' : path) + '/' + f.name;
+    const action = f.isDir ? `loadFiles('${full}')` : `previewFile('${full.replace(/'/g,"\\'")}')`;
+    return `
+    <div class="file-row" onclick="${action}">
       <div class="file-icon">${f.isDir ? '📁' : getFileIcon(f.name)}</div>
       <div class="file-name" style="color:${f.isDir?'var(--accent2)':'var(--text)'}">${escHtml(f.name)}</div>
       <div class="file-size">${f.size}</div>
       <div class="file-date">${f.modified}</div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
+  document.getElementById('file-preview-card').style.display = 'none';
+}
+
+// v0.3: text file preview
+async function previewFile(path) {
+  const card = document.getElementById('file-preview-card');
+  const nameEl = document.getElementById('file-preview-name');
+  const contentEl = document.getElementById('file-preview-content');
+  card.style.display = 'block';
+  nameEl.textContent = path;
+  contentEl.textContent = 'Loading…';
+  try {
+    const r = await fetch(`/api/files/read?path=${encodeURIComponent(path)}`);
+    const d = await r.json();
+    if (d.status === 'error') { contentEl.textContent = 'Error: ' + d.message; return; }
+    contentEl.textContent = d.content + (d.truncated ? '\n\n… [truncated, file is larger than the 200KB preview cap]' : '');
+  } catch (e) {
+    contentEl.textContent = 'Error: ' + e.message;
+  }
 }
 
 function getFileIcon(name) {
@@ -1045,15 +1181,14 @@ function getFileIcon(name) {
 
 // ─── Packages ─────────────────────────────────────────────────────────────────
 async function loadPackages() {
-  const r = await fetch('/api/system');
-  // Load packages via terminal
-  const pr = await fetch('/api/terminal', {
-    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`command=dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | head -200`
-  });
-  const pd = await pr.json();
-  allPackages = (pd.output || '').split('\n').filter(Boolean);
-  renderPackages(allPackages);
+  try {
+    const r = await fetch('/api/packages');
+    const d = await r.json();
+    allPackages = d.packages || [];
+    renderPackages(allPackages);
+  } catch {
+    document.getElementById('pkg-tbody').innerHTML = '<tr><td colspan="2" style="color:var(--accent3)">Failed to load packages</td></tr>';
+  }
 }
 
 function renderPackages(pkgs) {
@@ -1090,22 +1225,11 @@ async function managePackage(action) {
 // ─── Users ────────────────────────────────────────────────────────────────────
 async function loadUsers() {
   try {
-    const [ur, gr] = await Promise.all([
-      fetch('/api/terminal', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-        body:'command=getent passwd | awk -F: \'{print $1" "$3" "$6}\'' }),
-      fetch('/api/terminal', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-        body:'command=getent group | awk -F: \'{print $1" "$3}\'' }),
-    ]);
+    const [ur, gr] = await Promise.all([fetch('/api/users'), fetch('/api/groups')]);
     const ud = await ur.json();
     const gd = await gr.json();
-    const users = (ud.output||'').split('\n').filter(Boolean).map(l => {
-      const [username,uid,home] = l.split(' ');
-      return {username,uid,home};
-    });
-    const groups = (gd.output||'').split('\n').filter(Boolean).map(l => {
-      const [groupname,gid] = l.split(' ');
-      return {groupname,gid};
-    });
+    const users = ud.users || [];
+    const groups = gd.groups || [];
     document.getElementById('users-tbody').innerHTML = users.map(u =>
       `<tr><td>${escHtml(u.username||'')}</td><td style="color:var(--text-dim)">${u.uid}</td><td style="color:var(--text-dim);font-size:10px">${escHtml(u.home||'')}</td></tr>`
     ).join('');
@@ -1207,10 +1331,25 @@ async function runSearch() {
   if (!q) return;
   const el = document.getElementById('search-results');
   el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Searching…</div>';
-  // Open DuckDuckGo in new tab as fallback (web scraping blocked in most envs)
-  window.open(`https://duckduckgo.com/?q=${encodeURIComponent(q)}`, '_blank');
-  el.innerHTML = `<div class="card"><div class="card-title">// search opened</div>
-    <p style="font-size:11px;color:var(--text-dim)">Search for <span style="color:var(--accent)">${escHtml(q)}</span> opened in new tab via DuckDuckGo.</p></div>`;
+  try {
+    const r = await fetch('/api/search', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `q=${encodeURIComponent(q)}`
+    });
+    const d = await r.json();
+    const results = d.results || [];
+    if (!results.length) {
+      el.innerHTML = '<div class="card"><span style="color:var(--text-dim)">No results, or search is unreachable from this host.</span></div>';
+      return;
+    }
+    el.innerHTML = `<div class="news-grid">${results.map(res => `
+      <div class="news-item">
+        <div class="news-title"><a href="${escHtml(res.url)}" target="_blank" rel="noopener">${escHtml(res.title)}</a></div>
+        <div class="news-summary">${escHtml(res.snippet||'')}</div>
+      </div>`).join('')}</div>`;
+  } catch {
+    el.innerHTML = '<div class="card"><span style="color:var(--accent3)">Search request failed</span></div>';
+  }
 }
 
 // ─── News ─────────────────────────────────────────────────────────────────────
@@ -1279,6 +1418,161 @@ async function runTerminalCommand() {
     out.appendChild(errEl);
   }
   out.scrollTop = out.scrollHeight;
+}
+
+// ─── Network interfaces (v0.3) ─────────────────────────────────────────────────
+async function loadInterfaces() {
+  const el = document.getElementById('iface-content');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/network/interfaces');
+    const d = await r.json();
+    const ifaces = d.interfaces || [];
+    if (!ifaces.length) { el.innerHTML = '<span style="color:var(--text-dim)">No interfaces found</span>'; return; }
+    el.innerHTML = `<table class="data-table">
+      <thead><tr><th>NAME</th><th>STATE</th><th>ADDRESSES</th></tr></thead>
+      <tbody>${ifaces.map(i => `<tr>
+        <td class="mono">${escHtml(i.name)}</td>
+        <td><span class="badge badge-${i.state==='UP'?'green':'red'}">${i.state}</span></td>
+        <td class="mono" style="color:var(--text-dim)">${escHtml(i.addrs||'–')}</td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading interfaces</span>';
+  }
+}
+
+// ─── Firewall (v0.3) ────────────────────────────────────────────────────────────
+async function loadFirewall() {
+  const statusEl = document.getElementById('fw-status');
+  const rulesEl = document.getElementById('fw-rules');
+  statusEl.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/firewall');
+    const d = await r.json();
+    if (!d.available) {
+      statusEl.innerHTML = '<span style="color:var(--text-dim)">ufw is not installed on this host</span>';
+      rulesEl.innerHTML = '';
+      return;
+    }
+    statusEl.innerHTML = `<span class="badge badge-${d.active?'green':'red'}">${d.active?'ACTIVE':'INACTIVE'}</span>
+      <button class="hk-btn ${d.active?'red':''}" style="margin-left:12px" onclick="fwToggle(${!d.active})">${d.active?'■ Disable':'▶ Enable'}</button>`;
+    const rules = d.rules || [];
+    rulesEl.innerHTML = rules.length ? `<table class="data-table"><tbody>${rules.map(r => {
+      const m = r.match(/^\[\s*(\d+)\]\s*(.*)$/);
+      const num = m ? m[1] : '';
+      const text = m ? m[2] : r;
+      return `<tr><td style="color:var(--text-dim);width:40px">#${num}</td><td class="mono">${escHtml(text)}</td>
+        <td style="text-align:right"><button class="hk-btn red" style="padding:2px 8px;font-size:10px" onclick="fwDeleteRule('${num}')">✕</button></td></tr>`;
+    }).join('')}</tbody></table>` : '<span style="color:var(--text-dim);font-size:11px">No rules configured</span>';
+  } catch {
+    statusEl.innerHTML = '<span style="color:var(--accent3)">Error loading firewall status</span>';
+  }
+}
+async function fwToggle(enable) {
+  await fetch('/api/firewall/toggle', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`enabled=${enable}` });
+  loadFirewall();
+}
+async function fwAddRule() {
+  const spec = document.getElementById('fw-rule-input').value.trim();
+  if (!spec) return;
+  const r = await fetch('/api/firewall/rule', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`spec=${encodeURIComponent(spec)}` });
+  const d = await r.json();
+  toast(d.message || (d.status==='success'?'Rule added':'Failed'), d.status!=='success');
+  document.getElementById('fw-rule-input').value = '';
+  loadFirewall();
+}
+async function fwDeleteRule(number) {
+  const r = await fetch(`/api/firewall/rule?number=${number}`, { method:'DELETE' });
+  const d = await r.json();
+  toast(d.message || (d.status==='success'?'Rule removed':'Failed'), d.status!=='success');
+  loadFirewall();
+}
+
+// ─── Scheduler / cron (v0.3) ────────────────────────────────────────────────────
+async function loadCron() {
+  const el = document.getElementById('cron-list');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/cron');
+    const d = await r.json();
+    const jobs = d.jobs || [];
+    el.innerHTML = jobs.length ? `<table class="data-table"><tbody>${jobs.map(j => `
+      <tr><td class="mono">${escHtml(j.line)}</td>
+      <td style="text-align:right"><button class="hk-btn red" style="padding:2px 8px;font-size:10px" onclick="cronRemove(${j.index})">✕</button></td></tr>
+    `).join('')}</tbody></table>` : '<span style="color:var(--text-dim);font-size:11px">No scheduled jobs</span>';
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading crontab</span>';
+  }
+}
+async function cronAdd() {
+  const line = document.getElementById('cron-input').value.trim();
+  if (!line) return;
+  const r = await fetch('/api/cron', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`line=${encodeURIComponent(line)}` });
+  const d = await r.json();
+  toast(d.message || (d.status==='success'?'Job added':'Failed'), d.status!=='success');
+  document.getElementById('cron-input').value = '';
+  loadCron();
+}
+async function cronRemove(index) {
+  const r = await fetch(`/api/cron?index=${index}`, { method:'DELETE' });
+  const d = await r.json();
+  toast(d.message || (d.status==='success'?'Job removed':'Failed'), d.status!=='success');
+  loadCron();
+}
+
+// ─── Containers (v0.3) ──────────────────────────────────────────────────────────
+async function loadContainers() {
+  const el = document.getElementById('container-list');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/containers');
+    const d = await r.json();
+    if (d.status === 'error') { el.innerHTML = `<span style="color:var(--text-dim)">${escHtml(d.message)}</span>`; return; }
+    const list = d.containers || [];
+    el.innerHTML = list.length ? `<table class="data-table">
+      <thead><tr><th>ID</th><th>IMAGE</th><th>STATUS</th><th>NAME</th><th></th></tr></thead>
+      <tbody>${list.map(c => `<tr>
+        <td class="mono">${escHtml(c.id.slice(0,12))}</td>
+        <td class="mono">${escHtml(c.image)}</td>
+        <td><span class="badge badge-${/up/i.test(c.status)?'green':'yellow'}">${escHtml(c.status)}</span></td>
+        <td>${escHtml(c.name)}</td>
+        <td style="white-space:nowrap">
+          <button class="hk-btn" style="padding:2px 8px;font-size:10px" onclick="containerAction('${c.id}','start')">▶</button>
+          <button class="hk-btn red" style="padding:2px 8px;font-size:10px" onclick="containerAction('${c.id}','stop')">■</button>
+          <button class="hk-btn yellow" style="padding:2px 8px;font-size:10px" onclick="containerAction('${c.id}','restart')">↺</button>
+          <button class="hk-btn blue" style="padding:2px 8px;font-size:10px" onclick="containerLogs('${c.id}')">▤</button>
+        </td>
+      </tr>`).join('')}</tbody></table>` : '<span style="color:var(--text-dim)">No containers found</span>';
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading containers</span>';
+  }
+}
+async function containerAction(id, action) {
+  const r = await fetch('/api/containers/action', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`id=${encodeURIComponent(id)}&action=${action}` });
+  const d = await r.json();
+  toast(d.message || (d.status==='success'?'Done':'Failed'), d.status!=='success');
+  loadContainers();
+}
+async function containerLogs(id) {
+  const out = document.getElementById('container-logs');
+  out.textContent = 'Loading logs…';
+  const r = await fetch(`/api/containers/logs?id=${encodeURIComponent(id)}`);
+  const d = await r.json();
+  out.textContent = d.logs || d.message || 'No output';
+}
+
+// ─── Audit log (v0.3) ───────────────────────────────────────────────────────────
+async function loadAudit() {
+  const el = document.getElementById('audit-output');
+  el.innerHTML = '<div class="loading"><div class="loading-spinner"></div>Loading…</div>';
+  try {
+    const r = await fetch('/api/audit');
+    const d = await r.json();
+    const lines = d.entries || [];
+    el.innerHTML = lines.length ? lines.map(l => `<div class="log-line">${escHtml(l)}</div>`).join('') : '<span style="color:var(--text-dim)">No audit entries yet</span>';
+  } catch {
+    el.innerHTML = '<span style="color:var(--accent3)">Error loading audit log</span>';
+  }
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
