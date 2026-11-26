@@ -1,0 +1,179 @@
+mod util
+mod http
+mod ctx
+mod audit
+mod sys
+
+fn binary() -> string is
+    if util::have("docker") is return "docker" end
+    if util::have("podman") is return "podman" end
+    return ""
+end
+
+fn valid_id(id: string) -> bool is
+    if string_len(id) == 0 || string_len(id) > 200 is return false end
+    if !string_contains(util::alnum(), string_at(id, 0)) is return false end
+    return util::all_in(id, util::alnum() + "_.-:/@")
+end
+
+;; Runs the engine; retries with sudo on "permission denied". [output, rc].
+fn engine(args: string) -> [string] is
+    let bin: string = binary()
+    if bin == "" is return ["no container engine (docker/podman) found on this host", "127"] end
+    let r: [string] = sys::run_rc("timeout 40 " + bin + " " + args)
+    if r[1] != "0" && string_contains(string_lower(r[0]), "permission denied") is
+        return sys::run_rc("timeout 40 " + sys::priv(bin + " " + args))
+    end
+    return r
+end
+
+fn fields(line: string, n: int) -> [string] is
+    let mut f: [string] = string_split(line, "\t")
+    while array_len(f) < n is f = array_push(f, "") end
+    return f
+end
+
+fn fail(fd: int, r: [string]) is
+    http::err(fd, 502, "exit status " + r[1] + ": " + string_trim(r[0]))
+end
+
+pub fn containers(fd: int, c: [string]) is
+    if binary() == "" is
+        http::respond_json(fd, 200, util::jo([util::ks("engine", ""), util::kv("containers", "[]"),
+            util::ks("message", "no container engine (docker/podman) found on this host")]))
+        return
+    end
+    let r: [string] = engine("ps -a --format " + util::sq("{{{{.ID}}}}\t{{{{.Image}}}}\t{{{{.Status}}}}\t{{{{.Names}}}}\t{{{{.State}}}}\t{{{{.Ports}}}}\t{{{{.CreatedAt}}}}") + sys::json_safe())
+    let ls: [string] = string_split(string_trim(r[0]), "\n")
+    if r[1] != "0" && r[0] != "" && !string_contains(r[0], "\t") && array_len(ls) > 0 && string_contains(string_lower(r[0]), "error") is
+        fail(fd, r)
+        return
+    end
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if ls[i] != "" && string_contains(ls[i], "\t") is
+            let f: [string] = fields(ls[i], 7)
+            rows = array_push(rows, util::jo([util::ks("id", f[0]), util::ks("image", f[1]), util::ks("status", f[2]), util::ks("name", f[3]),
+                util::ks("state", f[4]), util::ks("ports", f[5]), util::ks("created", f[6])]))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::ks("engine", binary()), util::kv("containers", util::ja(rows))]))
+end
+
+pub fn container_stats(fd: int, c: [string]) is
+    let r: [string] = engine("stats --no-stream --format " + util::sq("{{{{.Name}}}}\t{{{{.CPUPerc}}}}\t{{{{.MemUsage}}}}\t{{{{.MemPerc}}}}\t{{{{.NetIO}}}}"))
+    if r[1] != "0" is
+        fail(fd, r)
+        return
+    end
+    let ls: [string] = string_split(string_trim(r[0]), "\n")
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if ls[i] != "" is
+            let f: [string] = fields(ls[i], 5)
+            rows = array_push(rows, util::jo([util::ks("name", f[0]), util::ks("cpu", f[1]), util::ks("mem", f[2]), util::ks("mem_pct", f[3]), util::ks("net", f[4])]))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("stats", util::ja(rows))]))
+end
+
+pub fn images(fd: int, c: [string]) is
+    let r: [string] = engine("images --format " + util::sq("{{{{.ID}}}}\t{{{{.Repository}}}}\t{{{{.Tag}}}}\t{{{{.Size}}}}\t{{{{.CreatedSince}}}}"))
+    if r[1] != "0" is
+        fail(fd, r)
+        return
+    end
+    let ls: [string] = string_split(string_trim(r[0]), "\n")
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if ls[i] != "" is
+            let f: [string] = fields(ls[i], 5)
+            rows = array_push(rows, util::jo([util::ks("id", f[0]), util::ks("repo", f[1]), util::ks("tag", f[2]), util::ks("size", f[3]), util::ks("age", f[4])]))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("images", util::ja(rows))]))
+end
+
+pub fn container_action(fd: int, c: [string]) is
+    let id: string = ctx::bstr(c, "id")
+    let action: string = ctx::bstr(c, "action")
+    if !valid_id(id) is
+        http::err(fd, 502, "invalid container id")
+        return
+    end
+    if !util::has(["start", "stop", "restart", "pause", "unpause", "kill", "rm"], action) is
+        http::err(fd, 502, "invalid action")
+        return
+    end
+    let r: [string] = engine(action + " " + util::sq(id))
+    if r[1] != "0" is
+        http::err(fd, 502, string_trim(r[0]) + " exit status " + r[1])
+        return
+    end
+    audit::log(ctx::user(c), "container." + action, id)
+    http::ok(fd, "container " + action + " done")
+end
+
+pub fn container_logs(fd: int, c: [string]) is
+    let id: string = ctx::q(c, "id")
+    if !valid_id(id) is
+        http::err(fd, 502, "invalid container id")
+        return
+    end
+    let mut n: int = util::to_i(ctx::q(c, "lines"))
+    if n <= 0 || n > 5000 is n = 200 end
+    let r: [string] = engine("logs --tail " + to_string(n) + " " + util::sq(id) + sys::json_safe())
+    if r[1] != "0" && r[0] == "" is
+        http::err(fd, 502, "exit status " + r[1])
+        return
+    end
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("logs", r[0])]))
+end
+
+;; Environment values are masked (KEY=••••••) exactly as in the Go version.
+pub fn container_inspect(fd: int, c: [string]) is
+    let id: string = ctx::q(c, "id")
+    if !valid_id(id) is
+        http::err(fd, 502, "invalid container id")
+        return
+    end
+    let r: [string] = engine("inspect " + util::sq(id))
+    if r[1] != "0" is
+        fail(fd, r)
+        return
+    end
+    let mut out: string = ""
+    if !util::have("python3") is
+        http::err(fd, 502, "inspect needs python3 on the host (used to mask environment values before they are shown)")
+        return
+    end
+    if util::have("python3") is
+        let tmp: string = "/tmp/.hckpt-insp." + random_hex(5)
+        file_write(tmp, r[0])
+        let red: string = shell("python3 -c " + util::sq("import json,sys\nd=json.load(open(sys.argv[1]))\nfor c in d:\n  e=c.get('Config',{{}}).get('Env')\n  if e: c['Config']['Env']=[x.split('=',1)[0]+'=••••••' if '=' in x else x for x in e]\nprint(json.dumps(d,indent=2,ensure_ascii=False))") + " " + util::sq(tmp) + " 2>/dev/null; rm -f " + util::sq(tmp))
+        if string_trim(red) != "" is out = red end
+    end
+    audit::log(ctx::user(c), "container.inspect", id)
+    http::respond_json(fd, 200, util::jo([util::ks("inspect", out)]))
+end
+
+pub fn image_remove(fd: int, c: [string]) is
+    let id: string = ctx::q(c, "id")
+    if !valid_id(id) is
+        http::err(fd, 502, "invalid image id")
+        return
+    end
+    let r: [string] = engine("rmi " + util::sq(id))
+    if r[1] != "0" is
+        http::err(fd, 502, string_trim(r[0]) + " exit status " + r[1])
+        return
+    end
+    audit::log(ctx::user(c), "image.remove", id)
+    http::ok(fd, "image removed")
+end
