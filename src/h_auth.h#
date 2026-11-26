@@ -1,0 +1,329 @@
+mod util
+mod http
+mod ctx
+mod auth
+mod audit
+mod config
+mod system
+mod m_term
+
+fn features_json() -> string is
+    return util::jo([util::kv("terminal", util::jb(config::f_terminal())), util::kv("pty", util::jb(config::f_pty() && m_term::pty_supported())),
+        util::kv("pentest", util::jb(config::f_pentest())), util::kv("docker", util::jb(config::f_docker())), util::kv("firewall", util::jb(config::f_firewall())),
+        util::kv("cron", util::jb(config::f_cron())), util::kv("search", util::jb(config::f_search())), util::kv("news", util::jb(config::f_news())),
+        util::kv("backup", util::jb(config::f_backup()))])
+end
+
+pub fn cors_ok(c: [string]) -> bool is
+    if ctx::hdr(c, "X-Requested-With") != "HackerCockpit" is return false end
+    let o: string = ctx::hdr(c, "Origin")
+    if o != "" is
+        let i: int = string_find(o, "://")
+        if i < 0 || string_lower(string_slice(o, i + 3, string_len(o))) != string_lower(ctx::hdr(c, "Host")) is return false end
+    end
+    return true
+end
+
+fn is_tls(c: [string]) -> bool is
+    return config::trust_proxy() && string_lower(ctx::hdr(c, "X-Forwarded-Proto")) == "https"
+end
+
+fn cookie_header(tok: string, secure: bool, max_age: int) -> string is
+    let sec: string = if secure then "; Secure" else ""
+    return "Set-Cookie: " + auth::cookie_name() + "=" + tok + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + to_string(max_age) + sec + "\r\n"
+end
+
+pub fn status(fd: int, c: [string]) is
+    let mut pairs: [string] = [util::kv("auth_enabled", util::jb(config::auth_enabled())),
+        util::kv("logged_in", util::jb(ctx::user(c) != "")), util::ks("version", config::version()),
+        util::ks("codename", config::codename()), util::ks("hostname", system::hostname())]
+    if ctx::user(c) != "" is
+        pairs = array_push(pairs, util::ks("user", ctx::user(c)))
+        pairs = array_push(pairs, util::ks("role", ctx::role(c)))
+        pairs = array_push(pairs, util::kv("features", features_json()))
+        pairs = array_push(pairs, util::kv("tls", util::jb(is_tls(c))))
+        pairs = array_push(pairs, util::kv("secure_mode", util::jb(config::auth_enabled())))
+    end
+    http::respond_json(fd, 200, util::jo(pairs))
+end
+
+fn locked(fd: int, wait: int, msg: string) is
+    http::respond_json_h(fd, 429, "Retry-After: " + to_string(wait + 1) + "\r\n",
+        util::jo([util::ks("status", "error"), util::ks("message", msg + to_string(wait + 1) + " s")]))
+end
+
+pub fn login(fd: int, c: [string]) is
+    if !config::auth_enabled() is
+        http::err(fd, 400, "authentication is disabled")
+        return
+    end
+    if !cors_ok(c) is
+        http::err(fd, 403, "cross-site request blocked")
+        return
+    end
+    let username: string = ctx::bstr(c, "username")
+    let password: string = ctx::bstr(c, "password")
+    let ip: string = ctx::ip(c)
+    let ipk: string = "ip:" + ip
+    let uk: string = "u:" + string_lower(username)
+    let w1: int = auth::rl_blocked(ipk, 8, 300)
+    if w1 > 0 is
+        locked(fd, w1, "too many failed attempts — try again in ")
+        return
+    end
+    let w2: int = auth::rl_blocked(uk, 12, 900)
+    if w2 > 0 is
+        locked(fd, w2, "too many failed attempts — try again in ")
+        return
+    end
+    let u: string = auth::verify_user(username, password)
+    if u == "" is
+        auth::rl_fail(ipk, 300)
+        auth::rl_fail(uk, 900)
+        audit::log(username, "login.failed", "from " + ip)
+        sleep_ms(300)
+        http::err(fd, 401, "invalid username or password")
+        return
+    end
+    auth::rl_reset(ipk)
+    auth::rl_reset(uk)
+    if util::jbool(u, "totp_enabled") is
+        let pend: string = auth::mfa_create(util::jstr(u, "username"), ip)
+        audit::log(util::jstr(u, "username"), "login.password-ok", "awaiting 2FA, from " + ip)
+        http::respond_json(fd, 200, util::jo([util::ks("status", "mfa_required"), util::ks("pending", pend)]))
+        return
+    end
+    finish_login(fd, c, u, "from " + ip)
+end
+
+fn finish_login(fd: int, c: [string], u: string, note: string) is
+    let name: string = util::jstr(u, "username")
+    let tok: string = auth::session_create(name, ctx::ip(c), ctx::hdr(c, "User-Agent"))
+    audit::log(name, "login", note)
+    http::respond_json_h(fd, 200, cookie_header(tok, config::cookie_secure() || is_tls(c), config::session_ttl()),
+        util::jo([util::ks("status", "success"), util::ks("user", name), util::ks("role", util::jstr(u, "role"))]))
+end
+
+pub fn login_totp(fd: int, c: [string]) is
+    if !config::auth_enabled() is
+        http::err(fd, 400, "authentication is disabled")
+        return
+    end
+    if !cors_ok(c) is
+        http::err(fd, 403, "cross-site request blocked")
+        return
+    end
+    let pending: string = ctx::bstr(c, "pending")
+    let ip: string = ctx::ip(c)
+    let username: string = auth::mfa_peek(pending, ip)
+    if username == "" is
+        http::err(fd, 401, "the login attempt expired — sign in again")
+        return
+    end
+    let key: string = "totp:" + string_lower(username)
+    let w: int = auth::rl_blocked(key, 8, 900)
+    if w > 0 is
+        locked(fd, w, "too many attempts — try again in ")
+        return
+    end
+    if !auth::totp_login_verify(username, string_trim(ctx::bstr(c, "code"))) is
+        auth::rl_fail(key, 900)
+        audit::log(username, "login.2fa-failed", "from " + ip)
+        sleep_ms(300)
+        http::err(fd, 401, "incorrect code")
+        return
+    end
+    auth::rl_reset(key)
+    auth::mfa_consume(pending)
+    let u: string = auth::user_find(username)
+    if u == "" || util::jbool(u, "disabled") is
+        http::err(fd, 401, "account no longer available")
+        return
+    end
+    finish_login(fd, c, u, "from " + ip + " (2FA)")
+end
+
+pub fn logout(fd: int, c: [string]) is
+    let name: string = ctx::user(c)
+    if name != "" && ctx::via(c) == "session" is audit::log(name, "logout", "") end
+    auth::session_destroy(ctx::token(c))
+    http::respond_json_h(fd, 200, cookie_header("", false, 0),
+        util::jo([util::ks("status", "success"), util::ks("message", "signed out")]))
+end
+
+fn need_store(fd: int) -> bool is
+    if !config::auth_enabled() is
+        http::err(fd, 409, "authentication is disabled — start with HCKPT_AUTH=1 to manage panel accounts")
+        return false
+    end
+    return true
+end
+
+pub fn change_password(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    if ctx::via(c) != "session" is
+        http::err(fd, 403, "password changes require an interactive session")
+        return
+    end
+    let e: string = auth::change_password(ctx::user(c), ctx::bstr(c, "current"), ctx::bstr(c, "new"))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    let n: int = auth::sessions_destroy_user_except(ctx::user(c), ctx::token(c))
+    audit::log(ctx::user(c), "password.change", to_string(n) + " other session(s) ended")
+    http::ok(fd, "password changed")
+end
+
+pub fn totp_status(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    let u: string = auth::user_find(ctx::user(c))
+    if u == "" is
+        http::err(fd, 404, "no such user")
+        return
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("enabled", util::jb(util::jbool(u, "totp_enabled"))),
+        util::kv("pending", util::jb(util::jstr(u, "pending_totp_secret") != "")),
+        util::kv("remaining_backup_codes", util::ji(auth::totp_backup_remaining(ctx::user(c))))]))
+end
+
+pub fn totp_enroll(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    if ctx::via(c) != "session" is
+        http::err(fd, 403, "two-factor setup requires an interactive session")
+        return
+    end
+    let secret: string = auth::totp_enroll_begin(ctx::user(c))
+    if secret == "" is
+        http::err(fd, 400, "no such user")
+        return
+    end
+    audit::log(ctx::user(c), "totp.enroll-start", "")
+    http::respond_json(fd, 200, util::jo([util::ks("secret", secret), util::ks("uri", auth::totp_uri(ctx::user(c), secret))]))
+end
+
+pub fn totp_confirm(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    let r: string = auth::totp_enroll_confirm(ctx::user(c), ctx::bstr(c, "code"))
+    if string_starts_with(r, "ERR:") is
+        http::err(fd, 400, string_slice(r, 4, string_len(r)))
+        return
+    end
+    audit::log(ctx::user(c), "totp.enabled", "")
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::kv("backup_codes", util::jstrs(string_split(r, "\n"))),
+        util::ks("message", "Two-factor authentication is now required at sign-in. Save these backup codes somewhere safe — each works once, and this is the only time they are shown.")]))
+end
+
+pub fn totp_cancel(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    if !auth::totp_enroll_cancel(ctx::user(c)) is
+        http::err(fd, 400, "no such user")
+        return
+    end
+    http::ok(fd, "enrollment cancelled")
+end
+
+pub fn totp_disable(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    if auth::verify_user(ctx::user(c), ctx::bstr(c, "password")) == "" is
+        http::err(fd, 400, "incorrect password")
+        return
+    end
+    auth::totp_disable(ctx::user(c))
+    audit::log(ctx::user(c), "totp.disabled", "self-service")
+    http::ok(fd, "two-factor authentication disabled")
+end
+
+pub fn admin_totp_reset(fd: int, c: [string], name: string) is
+    if !need_store(fd) is return end
+    if !auth::totp_disable(name) is
+        http::err(fd, 400, "no such user")
+        return
+    end
+    audit::log(ctx::user(c), "totp.admin-reset", name)
+    http::ok(fd, "two-factor authentication reset for " + name)
+end
+
+pub fn sessions(fd: int, c: [string]) is
+    if !config::auth_enabled() is
+        http::respond_json(fd, 200, "{{\"sessions\":[]}}")
+        return
+    end
+    http::respond_json(fd, 200, "{{\"sessions\":" + auth::sessions_json(ctx::user(c), ctx::token(c)) + "}}")
+end
+
+pub fn session_kill(fd: int, c: [string], id: string) is
+    if !config::auth_enabled() is
+        http::err(fd, 409, "authentication is disabled")
+        return
+    end
+    if auth::session_kill_id(ctx::user(c), id) is
+        audit::log(ctx::user(c), "session.end", ctx::user(c) + " " + id)
+        http::ok(fd, "session ended")
+        return
+    end
+    http::err(fd, 404, "no such session")
+end
+
+pub fn admin_users(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    http::respond_json(fd, 200, "{{\"users\":" + auth::users_public_json() + "}}")
+end
+
+pub fn admin_user_create(fd: int, c: [string]) is
+    if !need_store(fd) is return end
+    let e: string = auth::create_user(ctx::bstr(c, "username"), ctx::bstr(c, "password"), ctx::bstr(c, "role"))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "panel-user.create", ctx::bstr(c, "username") + " as " + ctx::bstr(c, "role"))
+    http::ok(fd, "user created")
+end
+
+pub fn admin_user_update(fd: int, c: [string], name: string) is
+    if !need_store(fd) is return end
+    let disabled: bool = util::jbool(ctx::body(c), "disabled")
+    let e: string = auth::update_user(name, ctx::bstr(c, "role"), disabled)
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    if disabled is auth::sessions_destroy_user_except(name, "") end
+    audit::log(ctx::user(c), "panel-user.update", name + " role=" + ctx::bstr(c, "role") + " disabled=" + util::jb(disabled))
+    http::ok(fd, "user updated")
+end
+
+pub fn admin_user_delete(fd: int, c: [string], name: string) is
+    if !need_store(fd) is return end
+    if name == ctx::user(c) is
+        http::err(fd, 400, "you cannot delete your own account")
+        return
+    end
+    let e: string = auth::delete_user(name)
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    auth::sessions_destroy_user_except(name, "")
+    audit::log(ctx::user(c), "panel-user.delete", name)
+    http::ok(fd, "user deleted")
+end
+
+pub fn admin_user_password(fd: int, c: [string], name: string) is
+    if !need_store(fd) is return end
+    let e: string = auth::set_password(name, ctx::bstr(c, "password"))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    auth::sessions_destroy_user_except(name, "")
+    audit::log(ctx::user(c), "panel-user.reset-password", name)
+    http::ok(fd, "password reset; all sessions of that user were ended")
+end
+
+pub fn audit_list(fd: int, c: [string]) is
+    let mut n: int = util::to_i(ctx::q(c, "limit"))
+    if n <= 0 || n > 2000 is n = 300 end
+    http::respond_json(fd, 200, "{{\"entries\":" + util::jstrs(audit::tail(n, ctx::q(c, "q"))) + "}}")
+end
