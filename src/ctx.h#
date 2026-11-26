@@ -1,0 +1,36 @@
+mod http
+mod util
+
+pub fn make(method: string, path: string, query: string, head: string, body: string, ip: string, token: string) -> [string] is
+    return [method, path, query, head, body, "", "", "", ip, token, ""]
+end
+
+pub fn method(c: [string]) -> string is return c[0] end
+pub fn path(c: [string]) -> string is return c[1] end
+pub fn query(c: [string]) -> string is return c[2] end
+pub fn head(c: [string]) -> string is return c[3] end
+pub fn body(c: [string]) -> string is return c[4] end
+pub fn user(c: [string]) -> string is return c[5] end
+pub fn role(c: [string]) -> string is return c[6] end
+pub fn via(c: [string]) -> string is return c[7] end
+pub fn ip(c: [string]) -> string is return c[8] end
+pub fn token(c: [string]) -> string is return c[9] end
+
+pub fn with_principal(c: [string], user: string, role: string, via: string, scopes: string) -> [string] is
+    let sc: string = if scopes == "null" then "" else scopes
+    return [c[0], c[1], c[2], c[3], c[4], user, role, via, c[8], c[9], sc]
+end
+
+;; Scope list for `key` — only operators are narrowed (admins/viewers are not).
+;; Empty means "no narrowing".
+pub fn scope_list(c: [string], key: string) -> [string] is
+    if c[6] != "operator" || c[10] == "" is return [] end
+    return util::jstr_list(c[10], key)
+end
+
+pub fn q(c: [string], key: string) -> string is
+    return util::query_get(c[2], key)
+end
+
+pub fn bstr(c: [string], key: string) -> string is return util::jstr(c[4], key) end
+pub fn hdr(c: [string], name: string) -> string is return http::header(c[3], name) end
