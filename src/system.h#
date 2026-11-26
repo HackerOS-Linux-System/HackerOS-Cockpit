@@ -1,0 +1,214 @@
+mod util
+
+fn tenths_pct(used: int, total: int) -> int is
+    if total <= 0 is return 0 end
+    return (used * 1000 + total / 2) / total
+end
+
+fn fields(line: string) -> [string] is
+    return util::split_clean(string_replace(line, "\t", " "), " ")
+end
+
+pub fn hostname() -> string is
+    let h: string = string_trim(file_read("/proc/sys/kernel/hostname"))
+    if h == "" is return "hackeros" end
+    return h
+end
+
+fn kernel() -> string is
+    return string_trim(file_read("/proc/sys/kernel/osrelease"))
+end
+
+fn os_name() -> string is
+    if !file_exists("/etc/os-release") is return "Linux" end
+    let ls: [string] = string_split(file_read("/etc/os-release"), "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if string_starts_with(ls[i], "PRETTY_NAME=") is
+            return string_replace(string_slice(ls[i], 12, string_len(ls[i])), "\"", "")
+        end
+        i += 1
+    end
+    return "Linux"
+end
+
+;; ── CPU: two /proc/stat samples 250 ms apart ─────────────────────────────────
+
+fn cpu_times() -> [int] is
+    let ls: [string] = string_split(file_read("/proc/stat"), "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if string_starts_with(ls[i], "cpu ") is
+            let f: [string] = fields(ls[i])
+            let mut total: int = 0
+            let mut idle: int = 0
+            let mut k: int = 1
+            while k < array_len(f) is
+                let v: int = util::to_i(f[k])
+                if k <= 8 is total += v end
+                if k == 4 || k == 5 is idle += v end
+                k += 1
+            end
+            return [idle, total]
+        end
+        i += 1
+    end
+    return [0, 0]
+end
+
+;; CPU usage in tenths of a percent.
+pub fn cpu_tenths() -> int is
+    let a: [int] = cpu_times()
+    sleep_ms(250)
+    let b: [int] = cpu_times()
+    let dt: int = b[1] - a[1]
+    let di: int = b[0] - a[0]
+    if dt <= 0 is return 0 end
+    return tenths_pct(dt - di, dt)
+end
+
+pub fn cores() -> int is
+    let n: int = array_len(string_split(file_read("/proc/cpuinfo"), "\nprocessor")) - 1
+    let first: int = if string_starts_with(file_read("/proc/cpuinfo"), "processor") then 1 else 0
+    let total: int = n + first
+    if total < 1 is return 1 end
+    return total
+end
+
+;; ── memory / swap ────────────────────────────────────────────────────────────
+
+;; [mem_total, mem_used, swap_total, swap_used] in bytes.
+pub fn mem() -> [int] is
+    let ls: [string] = string_split(file_read("/proc/meminfo"), "\n")
+    let mut total: int = 0
+    let mut avail: int = 0
+    let mut st: int = 0
+    let mut sf: int = 0
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = fields(ls[i])
+        if array_len(f) >= 2 is
+            let v: int = util::to_i(f[1]) * 1024
+            if f[0] == "MemTotal:" is total = v end
+            if f[0] == "MemAvailable:" is avail = v end
+            if f[0] == "SwapTotal:" is st = v end
+            if f[0] == "SwapFree:" is sf = v end
+        end
+        i += 1
+    end
+    if avail > total is avail = total end
+    return [total, total - avail, st, st - sf]
+end
+
+;; [total, used] bytes of the filesystem holding `path`.
+pub fn disk_of(path: string) -> [int] is
+    let f: [string] = fields(shell("stat -f -c '%b %f %S' " + util::sq(path) + " 2>/dev/null"))
+    if array_len(f) < 3 is return [0, 0] end
+    let total: int = util::to_i(f[0]) * util::to_i(f[2])
+    let free: int = util::to_i(f[1]) * util::to_i(f[2])
+    return [total, total - free]
+end
+
+;; [rx, tx] cumulative bytes over all non-loopback interfaces.
+pub fn net_totals() -> [int] is
+    let ls: [string] = string_split(file_read("/proc/net/dev"), "\n")
+    let mut rx: int = 0
+    let mut tx: int = 0
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let c: int = string_find(ls[i], ":")
+        if c > 0 is
+            let name: string = string_trim(string_slice(ls[i], 0, c))
+            let f: [string] = fields(string_slice(ls[i], c + 1, string_len(ls[i])))
+            if name != "lo" && array_len(f) >= 9 is
+                rx += util::to_i(f[0])
+                tx += util::to_i(f[8])
+            end
+        end
+        i += 1
+    end
+    return [rx, tx]
+end
+
+fn load_raw() -> [string] is
+    let f: [string] = fields(file_read("/proc/loadavg"))
+    if array_len(f) < 3 is return ["0", "0", "0"] end
+    return [f[0], f[1], f[2]]
+end
+
+pub fn load1_raw() -> string is return load_raw()[0] end
+
+pub fn uptime_seconds() -> int is
+    let f: [string] = fields(file_read("/proc/uptime"))
+    if array_len(f) < 1 is return 0 end
+    return util::to_i(string_split(f[0], ".")[0])
+end
+
+pub fn human_uptime(sec: int) -> string is
+    let d: int = sec / 86400
+    let h: int = (sec % 86400) / 3600
+    let m: int = (sec % 3600) / 60
+    if d > 0 is return to_string(d) + "d " + to_string(h) + "h " + to_string(m) + "m" end
+    if h > 0 is return to_string(h) + "h " + to_string(m) + "m" end
+    return to_string(m) + "m"
+end
+
+;; Hottest thermal zone in tenths of °C (0 when unknown).
+pub fn temp_tenths() -> int is
+    let mut best: int = 0
+    let mut i: int = 0
+    while i < 16 is
+        let p: string = "/sys/class/thermal/thermal_zone" + to_string(i) + "/temp"
+        if file_exists(p) is
+            let milli: int = util::to_i(file_read(p))
+            if milli > best && milli < 150000 is best = milli end
+        end
+        i += 1
+    end
+    return best / 100
+end
+
+fn processes_json(n: int) -> string is
+    let out: string = shell("ps -eo user:16,pid,pcpu,pmem,stat,comm --sort=-pcpu --no-headers 2>/dev/null")
+    let ls: [string] = string_split(out, "\n")
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) && array_len(items) < n is
+        let f: [string] = fields(ls[i])
+        if array_len(f) >= 6 is
+            items = array_push(items, util::jo([util::ks("user", f[0]), util::kv("pid", util::ji(util::to_i(f[1]))),
+                util::kv("cpu", num_or_zero(f[2])), util::kv("mem", num_or_zero(f[3])),
+                util::ks("status", f[4]), util::ks("name", f[5])]))
+        end
+        i += 1
+    end
+    return util::ja(items)
+end
+
+fn num_or_zero(s: string) -> string is
+    if util::all_in(s, "0123456789.") && s != "" && s != "." is return s end
+    return "0"
+end
+
+;; Full /api/system document.
+pub fn collect_json() -> string is
+    let m: [int] = mem()
+    let d: [int] = disk_of("/")
+    let nt: [int] = net_totals()
+    let up: int = uptime_seconds()
+    let l: [string] = load_raw()
+    return util::jo([
+        util::ks("hostname", hostname()), util::ks("kernel", kernel()), util::ks("os", os_name()),
+        util::ks("uptime", human_uptime(up)), util::kv("uptime_seconds", util::ji(up)),
+        util::kv("cores", util::ji(cores())), util::kv("cpu", util::jtenths(cpu_tenths())),
+        util::kv("load", "[" + num_or_zero(l[0]) + "," + num_or_zero(l[1]) + "," + num_or_zero(l[2]) + "]"),
+        util::kv("mem_total", util::ji(m[0])), util::kv("mem_used", util::ji(m[1])),
+        util::kv("mem_percent", util::jtenths(tenths_pct(m[1], m[0]))),
+        util::kv("swap_total", util::ji(m[2])), util::kv("swap_used", util::ji(m[3])),
+        util::kv("disk_total", util::ji(d[0])), util::kv("disk_used", util::ji(d[1])),
+        util::kv("disk_percent", util::jtenths(tenths_pct(d[1], d[0]))),
+        util::kv("net_rx", util::ji(nt[0])), util::kv("net_tx", util::ji(nt[1])),
+        util::kv("temp_c", util::jtenths(temp_tenths())),
+        util::kv("processes", processes_json(12))
+    ])
+end
