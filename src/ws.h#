@@ -1,0 +1,111 @@
+mod util
+mod crypto
+mod net
+mod http
+mod ctx
+
+extern static [c] is
+    fn memmove(dst: int, src: int, n: int) -> int
+end
+
+pub fn accept_key(key: string) -> string is
+    let raw: string = crypto::b64_encode_raw(crypto::sha1(crypto::str_bytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
+    let mut pad: string = raw
+    while string_len(pad) % 4 != 0 is pad = pad + "=" end
+    return pad
+end
+
+;; Same-origin check (Origin host must equal Host); no Origin is allowed for
+;; non-browser clients.
+pub fn same_origin(c: [string]) -> bool is
+    let o: string = ctx::hdr(c, "Origin")
+    if o == "" is return true end
+    let i: int = string_find(o, "://")
+    if i < 0 is return false end
+    return string_lower(string_slice(o, i + 3, string_len(o))) == string_lower(ctx::hdr(c, "Host"))
+end
+
+pub fn is_upgrade(c: [string]) -> bool is
+    return string_lower(ctx::hdr(c, "Upgrade")) == "websocket" && string_contains(string_lower(ctx::hdr(c, "Connection")), "upgrade") && ctx::hdr(c, "Sec-WebSocket-Key") != ""
+end
+
+pub fn handshake(fd: int, c: [string]) -> bool is
+    return net::fd_write(fd, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+        accept_key(ctx::hdr(c, "Sec-WebSocket-Key")) + "\r\nX-Content-Type-Options: nosniff\r\n\r\n")
+end
+
+;; Sends a server frame whose payload already sits at buf[off .. off+n).
+;; `buf` must have 4 free bytes before `off` (the header is written in place).
+@pointers
+pub fn send_frame_inplace(fd: int, buf: int, off: int, n: int, opcode: int) -> bool is
+    if n < 126 is
+        ptr_write_i8(buf, off - 2, 128 + opcode)
+        ptr_write_i8(buf, off - 1, n)
+        return net::send_raw(fd, ptr_add(buf, off - 2), n + 2)
+    end
+    ptr_write_i8(buf, off - 4, 128 + opcode)
+    ptr_write_i8(buf, off - 3, 126)
+    ptr_write_i8(buf, off - 2, (n >> 8) & 255)
+    ptr_write_i8(buf, off - 1, n & 255)
+    return net::send_raw(fd, ptr_add(buf, off - 4), n + 4)
+end
+
+@pointers
+pub fn send_close(fd: int, code: int) -> bool is
+    let b: int = net::alloc(8)
+    ptr_write_i8(b, 4, (code >> 8) & 255)
+    ptr_write_i8(b, 5, code & 255)
+    let ok: bool = send_frame_inplace(fd, b, 4, 2, 8)
+    net::release(b)
+    return ok
+end
+
+;; Parses the first complete frame in ibuf[0..ilen). Returns
+;; [consumed, opcode, payload_offset, payload_len] or [0] when incomplete,
+;; [-1] when the frame is invalid / too large. Unmasks the payload in place.
+@pointers
+pub fn parse_frame(ibuf: int, ilen: int) -> [int] is
+    if ilen < 2 is return [0] end
+    let b0: int = ptr_read_i8(ibuf, 0) & 255
+    let b1: int = ptr_read_i8(ibuf, 1) & 255
+    let masked: bool = (b1 & 128) != 0
+    let l7: int = b1 & 127
+    let mut hdr: int = 2
+    let mut len: int = l7
+    if l7 == 126 is
+        if ilen < 4 is return [0] end
+        len = ((ptr_read_i8(ibuf, 2) & 255) << 8) | (ptr_read_i8(ibuf, 3) & 255)
+        hdr = 4
+    else if l7 == 127 is
+        if ilen < 10 is return [0] end
+        len = ((ptr_read_i8(ibuf, 6) & 255) << 24) | ((ptr_read_i8(ibuf, 7) & 255) << 16) | ((ptr_read_i8(ibuf, 8) & 255) << 8) | (ptr_read_i8(ibuf, 9) & 255)
+        hdr = 10
+        if (ptr_read_i8(ibuf, 2) & 255) != 0 || (ptr_read_i8(ibuf, 3) & 255) != 0 || (ptr_read_i8(ibuf, 4) & 255) != 0 || (ptr_read_i8(ibuf, 5) & 255) != 0 is return [-1] end
+    end
+    if len > 65536 is return [-1] end
+    let mut moff: int = hdr
+    if masked is hdr += 4 end
+    if ilen < hdr + len is return [0] end
+    if masked is
+        let mut i: int = 0
+        while i < len is
+            let m: int = ptr_read_i8(ibuf, moff + (i % 4)) & 255
+            let p: int = ptr_read_i8(ibuf, hdr + i) & 255
+            ptr_write_i8(ibuf, hdr + i, p ^ m)
+            i += 1
+        end
+    end
+    return [hdr + len, b0 & 15, hdr, len]
+end
+
+@pointers
+pub fn shift_buffer(ibuf: int, consumed: int, ilen: int) is
+    if ilen > consumed is memmove(ibuf, ptr_add(ibuf, consumed), ilen - consumed) end
+end
+
+;; Payload bytes [off, off+len) of a buffer as a string (text frames).
+@pointers
+pub fn payload_text(ibuf: int, off: int, len: int) -> string is
+    ptr_write_i8(ibuf, off + len, 0)
+    return net::cstr(ptr_add(ibuf, off))
+end
