@@ -1,0 +1,212 @@
+extern static [c] is
+    fn socket(domain: int, kind: int, proto: int) -> int
+    fn setsockopt(fd: int, level: int, opt: int, val: int, len: int) -> int
+    fn bind(fd: int, addr: int, len: int) -> int
+    fn listen(fd: int, backlog: int) -> int
+    fn accept(fd: int, addr: int, len: int) -> int
+    fn recv(fd: int, buf: int, n: int, flags: int) -> int
+    fn send(fd: int, buf: int, n: int, flags: int) -> int
+    fn close(fd: int) -> int
+    fn fork() -> int
+    fn waitpid(pid: int, status: int, opts: int) -> int
+    fn signal(sig: int, handler: int) -> int
+    fn malloc(size: int) -> int
+    fn free(ptr: int)
+    fn _exit(code: int)
+    fn getpeername(fd: int, addr: int, len: int) -> int
+    fn sendto(fd: int, buf: string, n: int, flags: int, addr: int, alen: int) -> int
+    fn strdup(p: int) -> string
+    fn getpid() -> int
+    fn getppid() -> int
+    fn fflush(f: int) -> int
+end
+
+const AF_INET: int = 2
+const SOCK_STREAM: int = 1
+const SOL_SOCKET: int = 1
+const SO_REUSEADDR: int = 2
+
+;; Listening socket on host:port ("127.0.0.1" only is supported for `host`
+;; other than "0.0.0.0"). Returns fd or -1.
+@pointers
+pub fn tcp_listen(host: string, port: int) -> int is
+    let fd: int = socket(AF_INET, SOCK_STREAM, 0)
+    if fd < 0 is return -1 end
+    let one: int = malloc(4)
+    ptr_write_i32(one, 0, 1)
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
+    free(one)
+    let sa: int = malloc(16)
+    let mut i: int = 0
+    while i < 16 is
+        ptr_write_i8(sa, i, 0)
+        i += 1
+    end
+    ptr_write_i16(sa, 0, AF_INET)
+    ptr_write_i8(sa, 2, (port >> 8) & 255)
+    ptr_write_i8(sa, 3, port & 255)
+    if host == "127.0.0.1" || host == "localhost" is
+        ptr_write_i8(sa, 4, 127)
+        ptr_write_i8(sa, 7, 1)
+    else is
+        ;; any other dotted-quad IPv4 address; "", "0.0.0.0" and "::" keep INADDR_ANY
+        let oct: [string] = string_split(host, ".")
+        if array_len(oct) == 4 is
+            let mut j: int = 0
+            while j < 4 is
+                let part: string = oct[j]
+                let mut v: int = 0
+                let mut ok: bool = string_len(part) > 0 && string_len(part) <= 3
+                let mut q: int = 0
+                while ok && q < string_len(part) is
+                    let d: int = string_find("0123456789", string_at(part, q))
+                    if d < 0 is ok = false else is v = v * 10 + d end
+                    q += 1
+                end
+                if !ok || v > 255 is
+                    free(sa)
+                    close(fd)
+                    return -1
+                end
+                ptr_write_i8(sa, 4 + j, v)
+                j += 1
+            end
+        end
+    end
+    let rc: int = bind(fd, sa, 16)
+    free(sa)
+    if rc < 0 is
+        close(fd)
+        return -1
+    end
+    if listen(fd, 128) < 0 is
+        close(fd)
+        return -1
+    end
+    return fd
+end
+
+pub fn tcp_accept(lfd: int) -> int is
+    return accept(lfd, 0, 0)
+end
+
+pub fn fd_close(fd: int) is
+    close(fd)
+end
+
+;; Reads up to `max` bytes; returns "" on EOF/error. The bytes are returned
+;; verbatim (strings in H# are byte strings), so UTF-8 passes through intact.
+;; Embedded NUL bytes would truncate the chunk — irrelevant for HTTP text/JSON.
+@pointers
+pub fn fd_read(fd: int, max: int) -> string is
+    let buf: int = malloc(max + 1)
+    let n: int = recv(fd, buf, max, 0)
+    if n <= 0 is
+        free(buf)
+        return ""
+    end
+    ptr_write_i8(buf, n, 0)
+    let s: string = strdup(buf)
+    free(buf)
+    return s
+end
+
+;; Writes the whole string byte-for-byte; returns false on error.
+pub fn fd_write(fd: int, data: string) -> bool is
+    let n: int = string_len(data)
+    let mut off: int = 0
+    while off < n is
+        let w: int = sendto(fd, string_slice(data, off, n), n - off, 0, 0, 0)
+        if w <= 0 is return false end
+        off += w
+    end
+    return true
+end
+
+;; Flush stdout. Buffered output (e.g. the one-time admin password) is lost when
+;; stdout is a pipe/file (systemd, docker) unless flushed, and a buffered byte
+;; would be duplicated into every forked child.
+pub fn flush_out() is
+    fflush(0)
+end
+
+pub fn proc_fork() -> int is
+    return fork()
+end
+
+pub fn proc_exit(code: int) is
+    _exit(code)
+end
+
+;; SIGCHLD -> SIG_IGN so forked handlers never become zombies.
+pub fn ignore_sigchld() is
+    signal(17, 1)
+    signal(13, 1)
+end
+
+;; Writes the bytes described by a hex string (two chars per byte) straight to
+;; the socket — used for embedded assets so binary files (woff2) stay intact.
+@pointers
+pub fn fd_write_hex(fd: int, hex: string) -> bool is
+    let n: int = string_len(hex) / 2
+    if n == 0 is return true end
+    let buf: int = malloc(n + 1)
+    let digits: string = "0123456789abcdef"
+    let mut i: int = 0
+    while i < n is
+        let hi: int = string_find(digits, string_at(hex, i * 2))
+        let lo: int = string_find(digits, string_at(hex, i * 2 + 1))
+        ptr_write_i8(buf, i, hi * 16 + lo)
+        i += 1
+    end
+    let mut off: int = 0
+    while off < n is
+        let w: int = send(fd, ptr_add(buf, off), n - off, 0)
+        if w <= 0 is
+            free(buf)
+            return false
+        end
+        off += w
+    end
+    free(buf)
+    return true
+end
+
+;; Dotted-quad IPv4 address of the connected peer ("" on failure).
+@pointers
+pub fn peer_ip(fd: int) -> string is
+    let sa: int = malloc(32)
+    let ln: int = malloc(4)
+    ptr_write_i32(ln, 0, 32)
+    let rc: int = getpeername(fd, sa, ln)
+    if rc < 0 is
+        free(sa)
+        free(ln)
+        return ""
+    end
+    let ip: string = to_string(ptr_read_i8(sa, 4) & 255) + "." + to_string(ptr_read_i8(sa, 5) & 255) + "." +
+                     to_string(ptr_read_i8(sa, 6) & 255) + "." + to_string(ptr_read_i8(sa, 7) & 255)
+    free(sa)
+    free(ln)
+    return ip
+end
+
+;; ── tiny pointer helpers for other modules (externs live only in this file) ──
+pub fn alloc(n: int) -> int is return malloc(n) end
+pub fn release(p: int) is free(p) end
+pub fn cstr(p: int) -> string is return strdup(p) end
+
+;; Sends n raw bytes from a native buffer (used for file downloads).
+@pointers
+pub fn send_raw(fd: int, p: int, n: int) -> bool is
+    let mut off: int = 0
+    while off < n is
+        let w: int = send(fd, ptr_add(p, off), n - off, 0)
+        if w <= 0 is return false end
+        off += w
+    end
+    return true
+end
+
+pub fn pid() -> int is return getpid() end
+pub fn ppid() -> int is return getppid() end
