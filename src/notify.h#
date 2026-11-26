@@ -1,0 +1,239 @@
+mod util
+mod config
+mod settings
+mod system
+
+fn events_path() -> string is return config::data_dir() + "/notifications.json" end
+fn active_path() -> string is return config::data_dir() + "/notify-active" end
+
+fn events() -> [string] is
+    if !file_exists(events_path()) is return [] end
+    return util::jitems(file_read(events_path()))
+end
+
+fn save(items: [string]) is
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    util::write_private(events_path(), util::ja(items))
+end
+
+fn active_keys() -> [string] is
+    if !file_exists(active_path()) is return [] end
+    return util::split_clean(file_read(active_path()), "\n")
+end
+
+fn save_active(keys: [string]) is
+    util::write_private(active_path(), util::join(keys, "\n"))
+end
+
+fn level_rank(l: string) -> int is
+    if l == "crit" is return 2 end
+    if l == "warn" is return 1 end
+    return 0
+end
+
+fn bg(cmd: string) is
+    shell("( " + cmd + " ) >/dev/null 2>&1 &")
+end
+
+fn json_body(level: string, kind: string, title: string, msg: string, time: string) -> string is
+    let host: string = system::hostname()
+    let text: string = "[" + level + "] " + title + " — " + msg + " (" + host + ")"
+    return util::jo([util::ks("text", text), util::ks("content", text), util::ks("host", host), util::ks("level", level),
+        util::ks("kind", kind), util::ks("title", title), util::ks("message", msg), util::ks("time", time)])
+end
+
+;; Returns "" on success or an error text.
+pub fn post_webhook(url: string, body: string) -> string is
+    let tmp: string = config::data_dir() + "/.webhook." + random_hex(4)
+    util::write_private(tmp, body)
+    let out: string = shell("curl -s -o /dev/null -m 6 -w '%{{http_code}}' -X POST -H 'Content-Type: application/json' --data-binary @" +
+        util::sq(tmp) + " " + util::sq(url) + " 2>&1; rm -f " + util::sq(tmp))
+    let code: string = string_trim(out)
+    if string_len(code) == 3 && util::is_digits(code) && util::to_i(code) < 300 && util::to_i(code) > 0 is return "" end
+    if code == "000" || code == "" is return "webhook unreachable" end
+    return "webhook answered HTTP " + code
+end
+
+pub fn email_valid_addr(a: string) -> bool is
+    let at: int = string_find(a, "@")
+    if at < 1 || string_rfind(a, "@") != at is return false end
+    let dom: string = string_slice(a, at + 1, string_len(a))
+    if string_find(dom, ".") < 1 || string_ends_with(dom, ".") is return false end
+    return util::all_in(string_slice(a, 0, at), util::alnum() + "._%+-") && util::all_in(dom, util::alnum() + ".-")
+end
+
+;; "" when valid, otherwise the message.
+pub fn email_validate(em: string) -> string is
+    if !util::jbool(em, "enabled") is return "" end
+    if util::jstr(em, "host") == "" is return "SMTP host is required" end
+    let port: int = util::jint(em, "port")
+    if port <= 0 || port > 65535 is return "SMTP port must be 1-65535" end
+    let sec: string = util::jstr(em, "security")
+    if !(sec == "" || sec == "starttls" || sec == "tls" || sec == "none") is return "security must be starttls, tls or none" end
+    if !email_valid_addr(util::jstr(em, "from")) is return "a valid From address is required" end
+    let to: [string] = util::jstr_list(em, "to")
+    if array_len(to) == 0 is return "at least one recipient is required" end
+    let mut i: int = 0
+    while i < array_len(to) is
+        if !email_valid_addr(to[i]) is return "invalid recipient address: " + to[i] end
+        i += 1
+    end
+    let ml: string = string_lower(util::jstr(em, "min_level"))
+    if !(ml == "" || ml == "info" || ml == "warn" || ml == "crit") is return "minimum level must be info, warn or crit" end
+    return ""
+end
+
+pub fn send_email(em: string, subject: string, body: string) -> string is
+    let e: string = email_validate(em)
+    if e != "" is return e end
+    let from: string = util::jstr(em, "from")
+    let to: [string] = util::jstr_list(em, "to")
+    let msg: string = "From: " + from + "\r\nTo: " + util::join(to, ", ") + "\r\nSubject: " + subject +
+        "\r\nDate: " + string_trim(shell("date -R")) + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body + "\r\n"
+    let tmp: string = config::data_dir() + "/.mail." + random_hex(4)
+    util::write_private(tmp, msg)
+    let sec: string = util::jstr(em, "security")
+    let scheme: string = if sec == "tls" then "smtps" else "smtp"
+    let mut cmd: string = "curl -sS -m 20 --url " + util::sq(scheme + "://" + util::jstr(em, "host") + ":" + to_string(util::jint(em, "port"))) +
+        " --mail-from " + util::sq(from)
+    let mut i: int = 0
+    while i < array_len(to) is
+        cmd = cmd + " --mail-rcpt " + util::sq(to[i])
+        i += 1
+    end
+    if sec == "" || sec == "starttls" is cmd = cmd + " --ssl-reqd" end
+    if util::jstr(em, "username") != "" is cmd = cmd + " --user " + util::sq(util::jstr(em, "username") + ":" + util::jstr(em, "password")) end
+    cmd = cmd + " -T " + util::sq(tmp)
+    let out: string = shell(cmd + " 2>&1 >/dev/null; echo \"rc=$?\"; rm -f " + util::sq(tmp))
+    let rc: int = string_rfind(out, "rc=")
+    if rc >= 0 && string_trim(string_slice(out, rc + 3, string_len(out))) == "0" is return "" end
+    if rc > 0 is return string_trim(string_slice(out, 0, rc)) end
+    return "e-mail delivery failed"
+end
+
+;; Adds an event. With a non-empty `key` the event fires once until resolved().
+pub fn emit(level: string, kind: string, key: string, title: string, msg: string) -> bool is
+    if key != "" is
+        let keys: [string] = active_keys()
+        if util::has(keys, key) is return false end
+        save_active(array_push(keys, key))
+    end
+    let items: [string] = events()
+    let mut id: int = 1
+    let mut i: int = 0
+    while i < array_len(items) is
+        if util::jint(items[i], "id") >= id is id = util::jint(items[i], "id") + 1 end
+        i += 1
+    end
+    let now: string = util::now_iso()
+    let ev: string = util::jo([util::kv("id", util::ji(id)), util::ks("time", now), util::ks("level", level), util::ks("kind", kind),
+        util::ks("title", title), util::ks("message", msg), util::kv("read", "false")])
+    let mut all: [string] = array_push(items, ev)
+    while array_len(all) > 300 is all = util::remove_at(all, 0) end
+    save(all)
+    let hook: string = settings::webhook()
+    if hook != "" is
+        let tmp: string = config::data_dir() + "/.hook." + to_string(id)
+        util::write_private(tmp, json_body(level, kind, title, msg, now))
+        bg("curl -s -o /dev/null -m 6 -X POST -H 'Content-Type: application/json' --data-binary @" + util::sq(tmp) + " " + util::sq(hook) + "; rm -f " + util::sq(tmp))
+    end
+    let em: string = settings::email()
+    let min: string = if util::jstr(em, "min_level") == "" then "warn" else string_lower(util::jstr(em, "min_level"))
+    if util::jbool(em, "enabled") && level_rank(level) >= level_rank(min) is
+        send_email(em, "[HackerCockpit/" + string_upper(level) + "] " + title,
+            msg + "\n\nHost: " + system::hostname() + "\nKind: " + kind + "\nLevel: " + level + "\nTime: " + now + "\n")
+    end
+    return true
+end
+
+pub fn resolve(key: string, kind: string, title: string, msg: string) is
+    let keys: [string] = active_keys()
+    if !util::has(keys, key) is return end
+    let mut rest: [string] = []
+    let mut i: int = 0
+    while i < array_len(keys) is
+        if keys[i] != key is rest = array_push(rest, keys[i]) end
+        i += 1
+    end
+    save_active(rest)
+    emit("info", kind, "", title, msg)
+end
+
+pub fn list_json(limit: int) -> string is
+    let items: [string] = events()
+    let mut out: [string] = []
+    let mut unread: int = 0
+    let mut i: int = array_len(items) - 1
+    while i >= 0 is
+        if !util::jbool(items[i], "read") is unread += 1 end
+        if array_len(out) < limit is out = array_push(out, items[i]) end
+        i -= 1
+    end
+    return "{{\"events\":" + util::ja(out) + ",\"unread\":" + to_string(unread) + "}}"
+end
+
+pub fn mark_read(id: int) is
+    let items: [string] = events()
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        let e: string = items[i]
+        if id == 0 || util::jint(e, "id") == id is
+            out = array_push(out, util::jo([util::kv("id", util::ji(util::jint(e, "id"))), util::ks("time", util::jstr(e, "time")),
+                util::ks("level", util::jstr(e, "level")), util::ks("kind", util::jstr(e, "kind")), util::ks("title", util::jstr(e, "title")),
+                util::ks("message", util::jstr(e, "message")), util::kv("read", "true")]))
+        else is
+            out = array_push(out, e)
+        end
+        i += 1
+    end
+    save(out)
+end
+
+pub fn clear() is
+    save([])
+end
+
+;; ── watcher (called from the background collector) ───────────────────────────
+
+fn pct_text(t: int) -> string is return to_string((t + 5) / 10) end
+
+pub fn on_sample(disk_t: int, mem_t: int) is
+    let dw: int = settings::disk_warn() * 10
+    let mw: int = settings::mem_warn() * 10
+    if disk_t >= dw is
+        emit("crit", "disk", "disk-high", "Disk almost full", "Root filesystem is at " + pct_text(disk_t) + "% (threshold " + to_string(dw / 10) + "%).")
+    else if disk_t < dw - 30 is
+        resolve("disk-high", "disk", "Disk usage back to normal", "Root filesystem is at " + pct_text(disk_t) + "%.")
+    end
+    let hf: string = config::data_dir() + "/.memhigh"
+    if mem_t >= mw is
+        let n: int = (if file_exists(hf) then util::to_i(file_read(hf)) else 0) + 1
+        util::write_private(hf, to_string(n))
+        if n >= 3 is emit("warn", "memory", "mem-high", "Memory pressure", "Memory usage is at " + pct_text(mem_t) + "% (threshold " + to_string(mw / 10) + "%).") end
+    else is
+        util::write_private(hf, "0")
+        if mem_t < mw - 30 is resolve("mem-high", "memory", "Memory usage back to normal", "Memory usage is at " + pct_text(mem_t) + "%.") end
+    end
+end
+
+pub fn check_service(name: string, active: bool, known: bool) is
+    if !known is return end
+    let key: string = "svc-" + name
+    if !active is
+        emit("crit", "service", key, "Service down: " + name, name + " is not running.")
+    else is
+        resolve(key, "service", "Service recovered: " + name, name + " is running again.")
+    end
+end
+
+pub fn check_cert(name: string, days_left: int) is
+    let key: string = "cert-" + name
+    if days_left < 0 is
+        emit("crit", "certificate", key, "Certificate expired", name + " expired " + to_string(0 - days_left) + " days ago.")
+    else if days_left <= settings::cert_warn() is
+        emit("warn", "certificate", key, "Certificate expires soon", name + " expires in " + to_string(days_left) + " days.")
+    else is
+        resolve(key, "certificate", "Certificate renewed", name + " is valid again.")
+    end
+end
