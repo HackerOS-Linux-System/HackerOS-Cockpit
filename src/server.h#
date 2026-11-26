@@ -1,0 +1,708 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod auth
+mod audit
+mod assets
+mod system
+mod h_auth
+mod h_sys
+mod h_admin
+mod m_ops
+mod m_users
+mod m_net
+mod m_fw
+mod m_cron
+mod m_docker
+mod m_certs
+mod m_misc
+mod m_disks
+mod m_metrics
+mod m_backup
+mod m_term
+mod ws
+
+fn page(fd: int, name: string) is
+    let hex: string = assets::asset_hex("templates/" + name)
+    if hex == "" is
+        http::err(fd, 500, "template missing")
+        return
+    end
+    http::respond_asset(fd, "text/html; charset=utf-8", hex)
+end
+
+fn serve_public(fd: int, path: string) is
+    let rel: string = string_slice(path, 8, string_len(path))
+    if rel == "" || string_contains(rel, "..") || string_contains(rel, "//") is
+        http::err(fd, 404, "not found")
+        return
+    end
+    let key: string = "public/" + rel
+    let hex: string = assets::asset_hex(key)
+    if hex == "" is
+        http::err(fd, 404, "not found")
+        return
+    end
+    http::respond_asset(fd, http::ctype_for(key), hex)
+end
+
+fn serve_logo(fd: int) is
+    let p: string = config::logo_path()
+    if !file_exists(p) is
+        http::err(fd, 404, "logo not found")
+        return
+    end
+    let hex: string = string_trim(shell("od -An -v -tx1 " + util::sq(p) + " | tr -d ' \\n'"))
+    http::respond_asset(fd, "image/png", hex)
+end
+
+;; Resolves the caller. Returns ctx with principal filled in, or user "" when
+;; unauthenticated. (API bearer tokens are not part of this port.)
+fn authenticate(c: [string]) -> [string] is
+    if !config::auth_enabled() is return ctx::with_principal(c, "local", "admin", "open", "") end
+    let authz: string = ctx::hdr(c, "Authorization")
+    if string_starts_with(authz, "Bearer ") is
+        let t: [string] = auth::token_lookup(string_trim(string_slice(authz, 7, string_len(authz))))
+        if array_len(t) == 3 is return ctx::with_principal(c, t[0], t[1], "token", t[2]) end
+        return c
+    end
+    let name: string = auth::session_user(ctx::token(c))
+    if name == "" is return c end
+    let u: string = auth::user_find(name)
+    if u == "" || util::jbool(u, "disabled") is return c end
+    return ctx::with_principal(c, name, util::jstr(u, "role"), "session", util::jget(u, "scopes"))
+end
+
+fn is_safe_method(m: string) -> bool is
+    return m == "GET" || m == "HEAD" || m == "OPTIONS"
+end
+
+;; Returns true when the request may proceed to the handler.
+fn guard(fd: int, c: [string], min: string) -> bool is
+    if ctx::user(c) == "" is
+        http::err_code(fd, 401, "unauthenticated", "authentication required")
+        return false
+    end
+    if !auth::role_allows(ctx::role(c), min) is
+        http::err_code(fd, 403, "forbidden", "your role (" + ctx::role(c) + ") may not do this — " + min + " required")
+        return false
+    end
+    if !is_safe_method(ctx::method(c)) && ctx::via(c) != "token" && !h_auth::cors_ok(c) is
+        http::err(fd, 403, "cross-site request blocked")
+        return false
+    end
+    return true
+end
+
+fn tail_after(path: string, prefix: string) -> string is
+    return url_decode(string_slice(path, string_len(prefix), string_len(path)))
+end
+
+;; "/api/x/NAME/rest" -> NAME ; `prefix` is "/api/x/".
+fn seg(path: string, prefix: string) -> string is
+    let rest: string = string_slice(path, string_len(prefix), string_len(path))
+    let cut: int = string_find(rest, "/")
+    if cut < 0 is return url_decode(rest) end
+    return url_decode(string_slice(rest, 0, cut))
+end
+
+;; Remainder of the path after the first segment following `prefix` ("" or "/x/…").
+fn after_seg(path: string, prefix: string) -> string is
+    let rest: string = string_slice(path, string_len(prefix), string_len(path))
+    let cut: int = string_find(rest, "/")
+    if cut < 0 is return "" end
+    return string_slice(rest, cut, string_len(rest))
+end
+
+fn not_ported(fd: int, what: string) is
+    http::err_code(fd, 501, "not_ported", what + " is not available in the H# build yet")
+end
+
+;; The route table. Mirrors httpserver/routes.go.
+fn route(fd: int, c0: [string]) is
+    let m: string = ctx::method(c0)
+    let p: string = ctx::path(c0)
+    let c: [string] = authenticate(c0)
+
+    if m == "GET" && p == "/healthz" is
+        http::ok(fd, "ok")
+        return
+    end
+    if m == "GET" && p == "/" is
+        if ctx::user(c) == "" is
+            page(fd, "login.html")
+        else is
+            page(fd, "app.html")
+        end
+        return
+    end
+    if m == "GET" && string_starts_with(p, "/public/") is
+        serve_public(fd, p)
+        return
+    end
+    if m == "GET" && p == "/logo" is
+        serve_logo(fd)
+        return
+    end
+
+    ;; ── auth ────────────────────────────────────────────────────────────
+    if p == "/api/auth/status" && m == "GET" is
+        h_auth::status(fd, c)
+        return
+    end
+    if p == "/api/auth/login" && m == "POST" is
+        h_auth::login(fd, c)
+        return
+    end
+    if p == "/api/auth/login/totp" && m == "POST" is
+        h_auth::login_totp(fd, c)
+        return
+    end
+    if p == "/api/auth/logout" && m == "POST" is
+        h_auth::logout(fd, c)
+        return
+    end
+    if p == "/api/auth/password" && m == "POST" is
+        if guard(fd, c, "viewer") is h_auth::change_password(fd, c) end
+        return
+    end
+    if p == "/api/auth/totp" && m == "GET" is
+        if guard(fd, c, "viewer") is h_auth::totp_status(fd, c) end
+        return
+    end
+    if p == "/api/auth/totp/enroll" && m == "POST" is
+        if guard(fd, c, "viewer") is h_auth::totp_enroll(fd, c) end
+        return
+    end
+    if p == "/api/auth/totp/confirm" && m == "POST" is
+        if guard(fd, c, "viewer") is h_auth::totp_confirm(fd, c) end
+        return
+    end
+    if p == "/api/auth/totp/cancel" && m == "POST" is
+        if guard(fd, c, "viewer") is h_auth::totp_cancel(fd, c) end
+        return
+    end
+    if p == "/api/auth/totp/disable" && m == "POST" is
+        if guard(fd, c, "viewer") is h_auth::totp_disable(fd, c) end
+        return
+    end
+    if p == "/api/auth/sessions" && m == "GET" is
+        if guard(fd, c, "viewer") is h_auth::sessions(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/auth/sessions/") && m == "DELETE" is
+        if guard(fd, c, "viewer") is h_auth::session_kill(fd, c, tail_after(p, "/api/auth/sessions/")) end
+        return
+    end
+
+    ;; ── admin ───────────────────────────────────────────────────────────
+    if p == "/api/admin/users" && m == "GET" is
+        if guard(fd, c, "admin") is h_auth::admin_users(fd, c) end
+        return
+    end
+    if p == "/api/admin/users" && m == "POST" is
+        if guard(fd, c, "admin") is h_auth::admin_user_create(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/admin/users/") is
+        let name: string = seg(p, "/api/admin/users/")
+        let rest2: string = after_seg(p, "/api/admin/users/")
+        if rest2 == "" && m == "PUT" is
+            if guard(fd, c, "admin") is h_auth::admin_user_update(fd, c, name) end
+            return
+        end
+        if rest2 == "" && m == "DELETE" is
+            if guard(fd, c, "admin") is h_auth::admin_user_delete(fd, c, name) end
+            return
+        end
+        if rest2 == "/password" && m == "POST" is
+            if guard(fd, c, "admin") is h_auth::admin_user_password(fd, c, name) end
+            return
+        end
+        if rest2 == "/totp/reset" && m == "POST" is
+            if guard(fd, c, "admin") is h_auth::admin_totp_reset(fd, c, name) end
+            return
+        end
+        if rest2 == "/scopes" && m == "PUT" is
+            if guard(fd, c, "admin") is h_admin::user_scopes(fd, c, name) end
+            return
+        end
+    end
+    if p == "/api/admin/tokens" && m == "GET" is
+        if guard(fd, c, "admin") is h_admin::tokens(fd, c) end
+        return
+    end
+    if p == "/api/admin/tokens" && m == "POST" is
+        if guard(fd, c, "admin") is h_admin::token_create(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/admin/tokens/") && m == "DELETE" is
+        if guard(fd, c, "admin") is h_admin::token_delete(fd, c, tail_after(p, "/api/admin/tokens/")) end
+        return
+    end
+    if p == "/api/audit" && m == "GET" is
+        if guard(fd, c, "admin") is h_auth::audit_list(fd, c) end
+        return
+    end
+    if p == "/api/settings" && m == "GET" is
+        if guard(fd, c, "admin") is h_admin::settings_get(fd, c) end
+        return
+    end
+    if p == "/api/settings" && m == "PUT" is
+        if guard(fd, c, "admin") is h_admin::settings_put(fd, c) end
+        return
+    end
+    if p == "/api/settings/export" && m == "GET" is
+        if guard(fd, c, "admin") is h_admin::settings_export(fd, c) end
+        return
+    end
+    if p == "/api/settings/import" && m == "POST" is
+        if guard(fd, c, "admin") is h_admin::settings_import(fd, c) end
+        return
+    end
+    if p == "/api/settings/history" && m == "GET" is
+        if guard(fd, c, "admin") is h_admin::settings_history(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/settings/rollback/") && m == "POST" is
+        if guard(fd, c, "admin") is h_admin::settings_rollback(fd, c, tail_after(p, "/api/settings/rollback/")) end
+        return
+    end
+    if p == "/api/settings/test-webhook" && m == "POST" is
+        if guard(fd, c, "admin") is h_admin::test_webhook(fd, c) end
+        return
+    end
+    if p == "/api/settings/test-email" && m == "POST" is
+        if guard(fd, c, "admin") is h_admin::test_email(fd, c) end
+        return
+    end
+
+    ;; ── monitoring ──────────────────────────────────────────────────────
+    if p == "/api/system" && m == "GET" is
+        if guard(fd, c, "viewer") is http::respond_json(fd, 200, system::collect_json()) end
+        return
+    end
+    if p == "/api/system/stream" && m == "GET" is
+        if guard(fd, c, "viewer") is h_sys::system_stream(fd) end
+        return
+    end
+    if p == "/api/metrics" && m == "GET" is
+        if guard(fd, c, "viewer") is m_metrics::metrics(fd, c) end
+        return
+    end
+    if p == "/api/metrics/interfaces" && m == "GET" is
+        if guard(fd, c, "viewer") is m_metrics::interfaces(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/metrics/iface/") && m == "GET" is
+        if guard(fd, c, "viewer") is m_metrics::iface(fd, c, tail_after(p, "/api/metrics/iface/")) end
+        return
+    end
+    if p == "/api/diagnostics" && m == "GET" is
+        if guard(fd, c, "viewer") is m_disks::diagnostics(fd, c) end
+        return
+    end
+    if p == "/api/disks" && m == "GET" is
+        if guard(fd, c, "viewer") is m_disks::disks(fd, c) end
+        return
+    end
+    if p == "/api/disks/smart" && m == "GET" is
+        if guard(fd, c, "operator") is m_disks::smart(fd, c) end
+        return
+    end
+    if p == "/api/notifications" && m == "GET" is
+        if guard(fd, c, "viewer") is m_metrics::notifications(fd, c) end
+        return
+    end
+    if p == "/api/notifications/read" && m == "POST" is
+        if guard(fd, c, "viewer") is m_metrics::notifications_read(fd, c) end
+        return
+    end
+    if p == "/api/notifications" && m == "DELETE" is
+        if guard(fd, c, "operator") is
+            audit::log(ctx::user(c), "notifications.clear", "")
+            m_metrics::notifications_clear(fd, c)
+        end
+        return
+    end
+    if p == "/api/fleet" && m == "GET" is
+        if guard(fd, c, "viewer") is m_misc::fleet(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/fleet/") is
+        let name: string = seg(p, "/api/fleet/")
+        let rest: string = after_seg(p, "/api/fleet/")
+        if rest == "/services" && m == "GET" is
+            if guard(fd, c, "viewer") is m_misc::fleet_services(fd, c, name) end
+            return
+        end
+        if rest == "/services/action" && m == "POST" is
+            if guard(fd, c, "operator") is m_misc::fleet_action(fd, c, name) end
+            return
+        end
+    end
+
+    ;; ── operations ──────────────────────────────────────────────────────
+    if p == "/api/services" && m == "GET" is
+        if guard(fd, c, "viewer") is h_sys::services(fd, c) end
+        return
+    end
+    if p == "/api/services/action" && m == "POST" is
+        if guard(fd, c, "operator") is h_sys::service_action(fd, c) end
+        return
+    end
+    if p == "/api/logs/sources" && m == "GET" is
+        if guard(fd, c, "operator") is m_ops::log_sources(fd, c) end
+        return
+    end
+    if p == "/api/logs" && m == "GET" is
+        if guard(fd, c, "operator") is m_ops::logs(fd, c) end
+        return
+    end
+    if p == "/api/logs/follow" && m == "POST" is
+        if guard(fd, c, "operator") is m_ops::log_follow(fd, c) end
+        return
+    end
+    if p == "/api/files" && m == "GET" is
+        if guard(fd, c, "operator") is m_ops::files(fd, c) end
+        return
+    end
+    if p == "/api/files/read" && m == "GET" is
+        if guard(fd, c, "operator") is m_ops::file_read_preview(fd, c) end
+        return
+    end
+    if p == "/api/files/download" && m == "GET" is
+        if guard(fd, c, "operator") is m_ops::file_download(fd, c) end
+        return
+    end
+    if p == "/api/packages" && m == "GET" is
+        if guard(fd, c, "viewer") is m_ops::packages(fd, c) end
+        return
+    end
+    if p == "/api/packages/search" && m == "GET" is
+        if guard(fd, c, "viewer") is m_ops::packages_search(fd, c) end
+        return
+    end
+    if p == "/api/packages/upgradable" && m == "GET" is
+        if guard(fd, c, "viewer") is m_ops::packages_upgradable(fd, c) end
+        return
+    end
+    if p == "/api/packages/info" && m == "GET" is
+        if guard(fd, c, "viewer") is m_ops::package_info(fd, c) end
+        return
+    end
+    if p == "/api/packages/stream" && m == "POST" is
+        if guard(fd, c, "operator") && limited(fd, c, "pkg", 6, 60) is m_ops::packages_stream(fd, c) end
+        return
+    end
+
+    ;; ── system accounts ─────────────────────────────────────────────────
+    if p == "/api/sysusers" && m == "GET" is
+        if guard(fd, c, "operator") is m_users::sysusers(fd, c) end
+        return
+    end
+    if p == "/api/sysusers" && m == "POST" is
+        if guard(fd, c, "admin") is m_users::sysuser_create(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/sysusers/") is
+        let name: string = seg(p, "/api/sysusers/")
+        let rest: string = after_seg(p, "/api/sysusers/")
+        if rest == "" && m == "DELETE" is
+            if guard(fd, c, "admin") is m_users::sysuser_delete(fd, c, name) end
+            return
+        end
+        if rest == "/action" && m == "POST" is
+            if guard(fd, c, "admin") is m_users::sysuser_action(fd, c, name) end
+            return
+        end
+        if rest == "/keys" && m == "GET" is
+            if guard(fd, c, "admin") is m_users::keys_list(fd, c, name) end
+            return
+        end
+        if rest == "/keys" && m == "POST" is
+            if guard(fd, c, "admin") is m_users::keys_add(fd, c, name) end
+            return
+        end
+        if rest == "/keys" && m == "DELETE" is
+            if guard(fd, c, "admin") is m_users::keys_revoke(fd, c, name) end
+            return
+        end
+    end
+    if p == "/api/sshkeys/generate" && m == "POST" is
+        if guard(fd, c, "admin") is m_users::keygen(fd, c) end
+        return
+    end
+    if p == "/api/sysgroups" && m == "POST" is
+        if guard(fd, c, "admin") is m_users::group_create(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/sysgroups/") && m == "DELETE" is
+        if guard(fd, c, "admin") is m_users::group_delete(fd, c, tail_after(p, "/api/sysgroups/")) end
+        return
+    end
+
+    ;; ── network / firewall / cron / certs ───────────────────────────────
+    if p == "/api/network" && m == "GET" is
+        if guard(fd, c, "viewer") is m_net::network(fd, c) end
+        return
+    end
+    if p == "/api/network/tool" && m == "POST" is
+        if guard(fd, c, "operator") && limited(fd, c, "nettool", 12, 60) is m_net::network_tool(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/firewall") is
+        if !config::f_firewall() is
+            http::err_code(fd, 404, "feature_disabled", "this feature is disabled")
+            return
+        end
+        if p == "/api/firewall" && m == "GET" is
+            if guard(fd, c, "viewer") is m_fw::firewall(fd, c) end
+            return
+        end
+        if p == "/api/firewall/toggle" && m == "POST" is
+            if guard(fd, c, "operator") is m_fw::fw_toggle(fd, c) end
+            return
+        end
+        if p == "/api/firewall/rules" && m == "POST" is
+            if guard(fd, c, "operator") is m_fw::fw_add(fd, c) end
+            return
+        end
+        if string_starts_with(p, "/api/firewall/rules/") && m == "DELETE" is
+            if guard(fd, c, "operator") is m_fw::fw_delete(fd, c, tail_after(p, "/api/firewall/rules/")) end
+            return
+        end
+        if p == "/api/firewall/default" && m == "POST" is
+            if guard(fd, c, "operator") is m_fw::fw_default(fd, c) end
+            return
+        end
+    end
+    if string_starts_with(p, "/api/cron") is
+        if !config::f_cron() is
+            http::err_code(fd, 404, "feature_disabled", "this feature is disabled")
+            return
+        end
+        if p == "/api/cron" && m == "GET" is
+            if guard(fd, c, "viewer") is m_cron::cron_list(fd, c) end
+            return
+        end
+        if p == "/api/cron" && m == "POST" is
+            if guard(fd, c, "operator") is m_cron::cron_add(fd, c) end
+            return
+        end
+        let idx: string = seg(p, "/api/cron/")
+        if string_ends_with(p, "/toggle") && m == "POST" is
+            if guard(fd, c, "operator") is m_cron::cron_toggle(fd, c, idx) end
+            return
+        end
+        if m == "PUT" is
+            if guard(fd, c, "operator") is m_cron::cron_update(fd, c, idx) end
+            return
+        end
+        if m == "DELETE" is
+            if guard(fd, c, "operator") is m_cron::cron_remove(fd, c, idx) end
+            return
+        end
+    end
+    if p == "/api/certs" && m == "GET" is
+        if guard(fd, c, "viewer") is m_certs::certs(fd, c) end
+        return
+    end
+    if p == "/api/certs/selfsigned" && m == "POST" is
+        if guard(fd, c, "admin") is m_certs::selfsigned(fd, c) end
+        return
+    end
+    if p == "/api/certs/certbot/stream" && m == "POST" is
+        if guard(fd, c, "admin") && limited(fd, c, "cert", 5, 300) is m_certs::certbot_stream(fd, c) end
+        return
+    end
+    if p == "/api/certs/renew/stream" && m == "POST" is
+        if guard(fd, c, "admin") && limited(fd, c, "cert", 5, 300) is m_certs::renew_stream(fd, c) end
+        return
+    end
+
+    ;; ── containers ──────────────────────────────────────────────────────
+    if string_starts_with(p, "/api/containers") is
+        if !config::f_docker() is
+            http::err_code(fd, 404, "feature_disabled", "this feature is disabled")
+            return
+        end
+        if p == "/api/containers" && m == "GET" is
+            if guard(fd, c, "viewer") is m_docker::containers(fd, c) end
+            return
+        end
+        if p == "/api/containers/stats" && m == "GET" is
+            if guard(fd, c, "viewer") is m_docker::container_stats(fd, c) end
+            return
+        end
+        if p == "/api/containers/images" && m == "GET" is
+            if guard(fd, c, "viewer") is m_docker::images(fd, c) end
+            return
+        end
+        if p == "/api/containers/images" && m == "DELETE" is
+            if guard(fd, c, "operator") is m_docker::image_remove(fd, c) end
+            return
+        end
+        if p == "/api/containers/action" && m == "POST" is
+            if guard(fd, c, "operator") is m_docker::container_action(fd, c) end
+            return
+        end
+        if p == "/api/containers/logs" && m == "GET" is
+            if guard(fd, c, "operator") is m_docker::container_logs(fd, c) end
+            return
+        end
+        if p == "/api/containers/inspect" && m == "GET" is
+            if guard(fd, c, "operator") is m_docker::container_inspect(fd, c) end
+            return
+        end
+    end
+
+    ;; ── backups ─────────────────────────────────────────────────────────
+    if string_starts_with(p, "/api/backups") is
+        if !config::f_backup() is
+            http::err_code(fd, 404, "feature_disabled", "this feature is disabled")
+            return
+        end
+        if p == "/api/backups" && m == "GET" is
+            if guard(fd, c, "operator") is m_backup::backups(fd, c) end
+            return
+        end
+        if p == "/api/backups" && m == "POST" is
+            if guard(fd, c, "operator") is m_backup::backup_save(fd, c, "") end
+            return
+        end
+        let id: string = seg(p, "/api/backups/")
+        let rest: string = after_seg(p, "/api/backups/")
+        if rest == "" && m == "PUT" is
+            if guard(fd, c, "operator") is m_backup::backup_save(fd, c, id) end
+            return
+        end
+        if rest == "" && m == "DELETE" is
+            if guard(fd, c, "operator") is m_backup::backup_delete(fd, c, id) end
+            return
+        end
+        if rest == "/run/stream" && m == "POST" is
+            if guard(fd, c, "operator") is m_backup::backup_run(fd, c, id) end
+            return
+        end
+        if rest == "/snapshots" && m == "GET" is
+            if guard(fd, c, "operator") is m_backup::backup_snapshots(fd, c, id) end
+            return
+        end
+    end
+
+    ;; ── terminal / pentest / search / news ──────────────────────────────
+    if string_starts_with(p, "/api/terminal") is
+        if p == "/api/terminal" && m == "POST" is
+            if feature(fd, config::f_terminal()) && guard(fd, c, "admin") is m_term::terminal_exec(fd, c) end
+            return
+        end
+        if p == "/api/terminal/stream" && m == "POST" is
+            if feature(fd, config::f_terminal()) && guard(fd, c, "admin") is m_term::terminal_stream(fd, c) end
+            return
+        end
+        if p == "/api/terminal/history" && m == "GET" is
+            if feature(fd, config::f_terminal()) && guard(fd, c, "admin") is m_term::terminal_history(fd, c) end
+            return
+        end
+        if p == "/api/terminal/ws" && m == "GET" is
+            if feature(fd, config::f_pty()) && guard(fd, c, "admin") is m_term::terminal_ws(fd, c) end
+            return
+        end
+        if p == "/api/terminal/sessions" && m == "GET" is
+            if feature(fd, config::f_pty()) && guard(fd, c, "admin") is m_term::sessions(fd, c) end
+            return
+        end
+        if string_starts_with(p, "/api/terminal/sessions/") && m == "DELETE" is
+            if feature(fd, config::f_pty()) && guard(fd, c, "admin") is m_term::session_close(fd, c, tail_after(p, "/api/terminal/sessions/")) end
+            return
+        end
+    end
+    if p == "/api/pentest/tools" && m == "GET" is
+        if feature(fd, config::f_pentest()) && guard(fd, c, "admin") is m_misc::pentest_tools(fd, c) end
+        return
+    end
+    if p == "/api/pentest/stream" && m == "POST" is
+        if feature(fd, config::f_pentest()) && guard(fd, c, "admin") && limited(fd, c, "pentest", 4, 60) is m_misc::pentest_stream(fd, c) end
+        return
+    end
+    if p == "/api/search" && m == "GET" is
+        if feature(fd, config::f_search()) && guard(fd, c, "viewer") && limited(fd, c, "search", 20, 60) is m_misc::search(fd, c) end
+        return
+    end
+    if string_starts_with(p, "/api/news/") && m == "GET" is
+        if feature(fd, config::f_news()) && guard(fd, c, "viewer") is m_misc::news(fd, c, tail_after(p, "/api/news/")) end
+        return
+    end
+
+    if string_starts_with(p, "/api/") is
+        if ctx::user(c) == "" is
+            http::err_code(fd, 401, "unauthenticated", "authentication required")
+        else is
+            http::err(fd, 404, "not found")
+        end
+        return
+    end
+    http::err(fd, 404, "not found")
+end
+
+;; Disabled-feature gate (answers 404 like the Go build's feature() wrapper).
+fn feature(fd: int, on: bool) -> bool is
+    if on is return true end
+    http::err_code(fd, 404, "feature_disabled", "this feature is disabled")
+    return false
+end
+
+;; Per-user sliding-window limiter for expensive actions.
+fn limited(fd: int, c: [string], name: string, max: int, window: int) -> bool is
+    let key: string = "act:" + name + ":" + ctx::user(c)
+    let w: int = auth::rl_blocked(key, max, window)
+    if w > 0 is
+        http::respond_json_h(fd, 429, "Retry-After: " + to_string(w) + "\r\n", util::jo([util::ks("status", "error"), util::ks("message", "too many requests — slow down")]))
+        return false
+    end
+    auth::rl_fail(key, window)
+    return true
+end
+
+fn handle(fd: int) is
+    process(fd, http::read_request(fd), net::peer_ip(fd))
+end
+
+;; Handles one already-read request (also the unit-test entry point).
+pub fn process(fd: int, raw: string, peer: string) is
+    if raw == "" is return end
+    let head: string = http::head_of(raw)
+    let target: string = http::target_of(head)
+    let mut ip: string = peer
+    if config::trust_proxy() && http::header(head, "X-Forwarded-For") != "" is
+        ip = string_trim(string_split(http::header(head, "X-Forwarded-For"), ",")[0])
+    end
+    let tok: string = util::cookie_get(http::header(head, "Cookie"), auth::cookie_name())
+    let c: [string] = ctx::make(http::method_of(head), http::path_of(target), http::query_of(target),
+                                head, http::body_of(raw), ip, tok)
+    route(fd, c)
+end
+
+;; Never returns. Parent keeps accepting; each connection runs in a child.
+pub fn serve(host: string, port: int) -> int is
+    let lfd: int = net::tcp_listen(host, port)
+    if lfd < 0 is return 1 end
+    net::ignore_sigchld()
+    while true is
+        let fd: int = net::tcp_accept(lfd)
+        if fd >= 0 is
+            let pid: int = net::proc_fork()
+            if pid == 0 is
+                net::fd_close(lfd)
+                handle(fd)
+                net::fd_close(fd)
+                net::proc_exit(0)
+            end
+            net::fd_close(fd)
+        end
+    end
+    return 0
+end
