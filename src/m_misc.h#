@@ -1,0 +1,404 @@
+mod util
+mod http
+mod ctx
+mod config
+mod audit
+mod settings
+mod system
+mod sys
+
+fn curl_get(url: string, extra: string) -> string is
+    return shell("curl -sS -L -m 12 --max-filesize 4000000 " + extra + " " + util::sq(url) + " 2>/dev/null")
+end
+
+fn safe_url(u: string) -> bool is
+    let t: string = string_trim(u)
+    if !(string_starts_with(t, "http://") || string_starts_with(t, "https://")) is return false end
+    return string_len(t) > 10 && !string_contains(t, " ") && !string_contains(t, "\n")
+end
+
+;; Strips tags, decodes the common entities, collapses whitespace.
+fn clean(s: string, max: int) -> string is
+    let mut out: string = ""
+    let mut in_tag: bool = false
+    let mut i: int = 0
+    while i < string_len(s) is
+        let ch: string = string_at(s, i)
+        if ch == "<" is
+            in_tag = true
+        else if ch == ">" && in_tag is
+            in_tag = false
+        else if !in_tag is
+            out = out + ch
+        end
+        i += 1
+    end
+    out = string_replace(out, "<![CDATA[", "")
+    out = string_replace(out, "]]>", "")
+    out = string_replace(string_replace(string_replace(out, "&amp;", "&"), "&lt;", "<"), "&gt;", ">")
+    out = string_replace(string_replace(string_replace(out, "&quot;", "\""), "&#39;", "'"), "&nbsp;", " ")
+    out = string_replace(string_replace(string_replace(out, "\n", " "), "\r", " "), "\t", " ")
+    out = util::join(util::split_clean(out, " "), " ")
+    if string_len(out) > max is out = string_slice(out, 0, max) + "…" end
+    return out
+end
+
+;; ── search ───────────────────────────────────────────────────────────────────
+
+fn tag_between(s: string, open: string, close: string) -> string is
+    let a: int = string_find(s, open)
+    if a < 0 is return "" end
+    let rest: string = string_slice(s, a + string_len(open), string_len(s))
+    let b: int = string_find(rest, close)
+    if b < 0 is return "" end
+    return string_slice(rest, 0, b)
+end
+
+fn ddg_redirect(href0: string) -> string is
+    let href: string = if string_starts_with(href0, "//") then "https:" + href0 else href0
+    let a: int = string_find(href, "uddg=")
+    if string_contains(href, "duckduckgo.com/l/") && a >= 0 is
+        let rest: string = string_slice(href, a + 5, string_len(href))
+        let amp: int = string_find(rest, "&")
+        return url_decode(if amp >= 0 then string_slice(rest, 0, amp) else rest)
+    end
+    return href
+end
+
+fn parse_ddg(page: string) -> [string] is
+    let chunks: [string] = string_split(page, "class=\"result__a\"")
+    let mut out: [string] = []
+    let mut i: int = 1
+    while i < array_len(chunks) && array_len(out) < 10 is
+        let ch: string = chunks[i]
+        let href: string = tag_between(ch, "href=\"", "\"")
+        let gt: int = string_find(ch, ">")
+        let title_end: int = string_find(ch, "</a>")
+        let title: string = if gt >= 0 && title_end > gt then clean(string_slice(ch, gt + 1, title_end), 200) else ""
+        let sn: int = string_find(ch, "result__snippet")
+        let mut snippet: string = ""
+        if sn >= 0 is
+            let tail: string = string_slice(ch, sn, string_len(ch))
+            let g2: int = string_find(tail, ">")
+            let e2: int = string_find(tail, "</a>")
+            if g2 >= 0 && e2 > g2 is snippet = clean(string_slice(tail, g2 + 1, e2), 300) end
+        end
+        let url: string = ddg_redirect(string_replace(href, "&amp;", "&"))
+        if title != "" && safe_url(url) is
+            out = array_push(out, util::jo([util::ks("title", title), util::ks("url", url), util::ks("snippet", snippet)]))
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn search(fd: int, c: [string]) is
+    let q: string = string_trim(ctx::q(c, "q"))
+    if q == "" || string_len(q) > 300 is
+        http::err(fd, 502, "query must be 1–300 characters")
+        return
+    end
+    let kind: string = config::search_provider()
+    let mut results: [string] = []
+    if kind == "brave" is
+        if config::search_api_key() == "" is
+            http::err(fd, 502, "HCKPT_SEARCH_API_KEY is required for the brave provider")
+            return
+        end
+        let body: string = curl_get("https://api.search.brave.com/res/v1/web/search?q=" + url_encode(q) + "&count=10",
+            "-H " + util::sq("X-Subscription-Token: " + config::search_api_key()) + " -H 'Accept: application/json' --compressed")
+        let items: [string] = util::jitems(util::jget(util::jget(body, "web"), "results"))
+        let mut i: int = 0
+        while i < array_len(items) && array_len(results) < 10 is
+            if safe_url(util::jstr(items[i], "url")) is
+                results = array_push(results, util::jo([util::ks("title", clean(util::jstr(items[i], "title"), 200)), util::ks("url", util::jstr(items[i], "url")),
+                    util::ks("snippet", clean(util::jstr(items[i], "description"), 300))]))
+            end
+            i += 1
+        end
+    else if kind == "searx" is
+        if !safe_url(config::searx_url()) is
+            http::err(fd, 502, "HCKPT_SEARX_URL must be an http(s) URL")
+            return
+        end
+        let base: string = config::searx_url()
+        let body: string = curl_get((if string_ends_with(base, "/") then string_slice(base, 0, string_len(base) - 1) else base) + "/search?format=json&q=" + url_encode(q), "")
+        let items: [string] = util::jitems(util::jget(body, "results"))
+        let mut i: int = 0
+        while i < array_len(items) && array_len(results) < 10 is
+            if safe_url(util::jstr(items[i], "url")) is
+                results = array_push(results, util::jo([util::ks("title", clean(util::jstr(items[i], "title"), 200)), util::ks("url", util::jstr(items[i], "url")),
+                    util::ks("snippet", clean(util::jstr(items[i], "content"), 300))]))
+            end
+            i += 1
+        end
+    else is
+        let page: string = shell("curl -sS -L -m 12 --max-filesize 2000000 -A 'Mozilla/5.0 (X11; Linux x86_64) HackerCockpit/0.5' --data-urlencode " +
+            util::sq("q=" + q) + " https://html.duckduckgo.com/html/ 2>/dev/null")
+        results = parse_ddg(page)
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("results", util::ja(results)), util::ks("provider", kind)]))
+end
+
+;; ── news ─────────────────────────────────────────────────────────────────────
+
+fn feeds_for(topic: string) -> [string] is
+    if topic == "gaming" is return ["https://www.ign.com/rss/articles.xml", "https://www.gamespot.com/feeds/news/"] end
+    if topic == "cybersecurity" is return ["https://thehackernews.com/feeds/posts/default", "https://krebsonsecurity.com/feed/"] end
+    if topic == "linux" is return ["https://www.phoronix.com/rss.php", "https://lwn.net/headlines/rss"] end
+    return []
+end
+
+fn atom_link(entry: string) -> string is
+    let parts: [string] = string_split(entry, "<link")
+    let mut i: int = 1
+    while i < array_len(parts) is
+        let seg: string = parts[i]
+        let gt: int = string_find(seg, ">")
+        let attrs: string = if gt >= 0 then string_slice(seg, 0, gt) else seg
+        if !string_contains(attrs, "rel=\"") || string_contains(attrs, "rel=\"alternate\"") is
+            let h: string = tag_between(attrs, "href=\"", "\"")
+            if safe_url(h) is return h end
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn parse_feed(body: string) -> [string] is
+    let mut out: [string] = []
+    let is_atom: bool = string_contains(body, "<feed") && string_contains(body, "<entry")
+    let src: string = clean(tag_between(body, "<title>", "</title>"), 60)
+    let sep: string = if is_atom then "<entry" else "<item"
+    let chunks: [string] = string_split(body, sep)
+    let mut i: int = 1
+    while i < array_len(chunks) && array_len(out) < 8 is
+        let it: string = chunks[i]
+        let traw: string = tag_between(it, "<title", "</title>")
+        let tgt: int = string_find(traw, ">")
+        let tt: string = clean(if tgt >= 0 then string_slice(traw, tgt + 1, string_len(traw)) else traw, 200)
+        let mut link: string = ""
+        let mut summary: string = ""
+        let mut date: string = ""
+        if is_atom is
+            link = atom_link(it)
+            let s1: string = tag_between(it, "<summary", "</summary>")
+            let s2: string = tag_between(it, "<content", "</content>")
+            let raw: string = if s1 != "" then s1 else s2
+            let g: int = string_find(raw, ">")
+            summary = clean(if g >= 0 then string_slice(raw, g + 1, string_len(raw)) else raw, 220)
+            date = string_trim(tag_between(it, "<updated>", "</updated>"))
+        else is
+            link = string_trim(clean(tag_between(it, "<link>", "</link>"), 500))
+            if !safe_url(link) is link = string_trim(clean(tag_between(it, "<guid", "</guid>"), 500)) end
+            let g3: int = string_find(link, ">")
+            if g3 >= 0 && !safe_url(link) is link = string_trim(string_slice(link, g3 + 1, string_len(link))) end
+            if !safe_url(link) is link = "" end
+            summary = clean(tag_between(it, "<description>", "</description>"), 220)
+            date = string_trim(tag_between(it, "<pubDate>", "</pubDate>"))
+        end
+        if tt != "" is
+            out = array_push(out, util::jo([util::ks("title", tt), util::ks("link", link), util::ks("summary", summary), util::ks("source", src), util::ks("date", date)]))
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn news(fd: int, c: [string], topic: string) is
+    let feeds: [string] = feeds_for(topic)
+    if array_len(feeds) == 0 is
+        http::err(fd, 404, "unknown topic")
+        return
+    end
+    let cache: string = config::data_dir() + "/news-" + topic + ".json"
+    if file_exists(cache) && now_unix() - fs_mtime_s(cache) < 600 is
+        http::respond_json(fd, 200, util::jo([util::kv("news", file_read(cache)), util::ks("topic", topic)]))
+        return
+    end
+    let mut all: [string] = []
+    let mut i: int = 0
+    while i < array_len(feeds) is
+        all = array_concat(all, parse_feed(curl_get(feeds[i], "-A HackerCockpit/0.5")))
+        i += 1
+    end
+    while array_len(all) > 16 is all = util::remove_at(all, array_len(all) - 1) end
+    let doc: string = util::ja(all)
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    util::write_private(cache, doc)
+    http::respond_json(fd, 200, util::jo([util::kv("news", doc), util::ks("topic", topic)]))
+end
+
+fn fs_mtime_s(p: string) -> int is
+    return util::to_i(shell("stat -c %Y " + util::sq(p) + " 2>/dev/null"))
+end
+
+;; ── fleet ────────────────────────────────────────────────────────────────────
+
+fn host_valid(h: string) -> string is
+    let name: string = util::jstr(h, "name")
+    if name == "" || string_len(name) > 60 is return "host name required (max 60 chars)" end
+    let u: string = util::jstr(h, "url")
+    let stripped: string = if string_ends_with(u, "/") then string_slice(u, 0, string_len(u) - 1) else u
+    let scheme_end: int = string_find(stripped, "://")
+    if !safe_url(stripped) || scheme_end < 0 || string_contains(string_slice(stripped, scheme_end + 3, string_len(stripped)), "/") is
+        return "URL must look like https://host:4545"
+    end
+    return ""
+end
+
+fn host_curl(h: string, method: string, path: string, body: string) -> [string] is
+    let base: string = util::jstr(h, "url")
+    let url: string = (if string_ends_with(base, "/") then string_slice(base, 0, string_len(base) - 1) else base) + path
+    let mut cmd: string = "curl -sS -m 5 -o - -w '\\n@@%{{http_code}} %{{time_total}}' -X " + method
+    if util::jstr(h, "token") != "" is cmd = cmd + " -H " + util::sq("Authorization: Bearer " + util::jstr(h, "token")) end
+    if util::jbool(h, "insecure") is cmd = cmd + " -k" end
+    if body != "" is cmd = cmd + " -H 'Content-Type: application/json' --data-binary " + util::sq(body) end
+    let out: string = shell(cmd + " " + util::sq(url) + " 2>&1")
+    let at: int = string_rfind(out, "\n@@")
+    if at < 0 is return [out, "0", "0"] end
+    let meta: [string] = util::split_clean(string_slice(out, at + 3, string_len(out)), " ")
+    let ms: int = if array_len(meta) > 1 then util::to_i(string_replace(meta[1], ".", "")) / 1000 else 0
+    return [string_slice(out, 0, at), meta[0], to_string(ms)]
+end
+
+pub fn fleet(fd: int, c: [string]) is
+    let hosts: [string] = util::jitems(settings::hosts())
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(hosts) is
+        let h: string = hosts[i]
+        let name: string = util::jstr(h, "name")
+        let url: string = util::jstr(h, "url")
+        let ve: string = host_valid(h)
+        if ve != "" is
+            rows = array_push(rows, util::jo([util::ks("name", name), util::ks("url", url), util::kv("ok", "false"), util::ks("error", ve), util::kv("latency_ms", "0")]))
+        else is
+            let r: [string] = host_curl(h, "GET", "/api/system", "")
+            if r[1] == "000" || r[1] == "0" is
+                rows = array_push(rows, util::jo([util::ks("name", name), util::ks("url", url), util::kv("ok", "false"), util::ks("error", "unreachable"), util::kv("latency_ms", r[2])]))
+            else if r[1] != "200" is
+                rows = array_push(rows, util::jo([util::ks("name", name), util::ks("url", url), util::kv("ok", "false"), util::ks("error", "HTTP " + r[1]), util::kv("latency_ms", r[2])]))
+            else is
+                rows = array_push(rows, util::jo([util::ks("name", name), util::ks("url", url), util::kv("ok", "true"), util::kv("latency_ms", r[2]), util::kv("info", string_trim(r[0]))]))
+            end
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("hosts", util::ja(rows))]))
+end
+
+fn find_host(name: string) -> string is
+    let hosts: [string] = util::jitems(settings::hosts())
+    let mut i: int = 0
+    while i < array_len(hosts) is
+        if util::jstr(hosts[i], "name") == name is return hosts[i] end
+        i += 1
+    end
+    return ""
+end
+
+fn relay(fd: int, h: string, method: string, path: string, body: string) is
+    let ve: string = host_valid(h)
+    if ve != "" is
+        http::err(fd, 502, ve)
+        return
+    end
+    let r: [string] = host_curl(h, method, path, body)
+    if r[1] == "0" || r[1] == "000" is
+        http::err(fd, 502, "unreachable: " + string_trim(r[0]))
+        return
+    end
+    if r[1] == "401" is
+        http::err(fd, 502, "the stored token for this host was rejected — check Settings → Fleet")
+        return
+    end
+    http::respond(fd, util::to_i(r[1]), "application/json; charset=utf-8", "", r[0])
+end
+
+pub fn fleet_services(fd: int, c: [string], name: string) is
+    let h: string = find_host(name)
+    if h == "" is
+        http::err(fd, 404, "no such fleet host")
+        return
+    end
+    relay(fd, h, "GET", "/api/services", "")
+end
+
+pub fn fleet_action(fd: int, c: [string], name: string) is
+    let h: string = find_host(name)
+    if h == "" is
+        http::err(fd, 404, "no such fleet host")
+        return
+    end
+    let b: string = util::jo([util::ks("name", ctx::bstr(c, "name")), util::ks("action", ctx::bstr(c, "action"))])
+    audit::log(ctx::user(c), "fleet.service." + ctx::bstr(c, "action"), name + ": " + ctx::bstr(c, "name"))
+    relay(fd, h, "POST", "/api/services/action", b)
+end
+
+pub fn host_validate_all(hosts_raw: string) -> string is
+    let hosts: [string] = util::jitems(hosts_raw)
+    let mut i: int = 0
+    while i < array_len(hosts) is
+        let e: string = host_valid(hosts[i])
+        if e != "" is return e end
+        i += 1
+    end
+    return ""
+end
+
+;; ── pentest ──────────────────────────────────────────────────────────────────
+
+fn profile_args(tool: string, profile: string) -> string is
+    if tool == "nmap" is
+        if profile == "quick" is return "-F -sV --open" end
+        if profile == "default" is return "-sV --open" end
+        if profile == "full" is return "-p- -sV --open -T4" end
+        if profile == "scripts" is return "-sC -sV --open" end
+        if profile == "ping" is return "-sn" end
+    end
+    if tool == "nikto" && profile == "default" is return "-h" end
+    if tool == "whois" && profile == "default" is return "" end
+    return "?"
+end
+
+pub fn target_ok(t: string) -> bool is
+    if string_len(t) < 1 || string_len(t) > 200 is return false end
+    if !(string_contains(util::alnum(), string_at(t, 0)) || string_at(t, 0) == "_") is return false end
+    return util::all_in(t, util::alnum() + "_.-:/")
+end
+
+pub fn pentest_tools(fd: int, c: [string]) is
+    let avail: string = util::jo([util::kv("nmap", util::jb(util::have("nmap"))), util::kv("nikto", util::jb(util::have("nikto"))), util::kv("whois", util::jb(util::have("whois")))])
+    let profiles: string = util::jo([util::kv("nmap", util::jstrs(["quick", "default", "full", "scripts", "ping"])), util::kv("nikto", util::jstrs(["default"])), util::kv("whois", util::jstrs(["default"]))])
+    http::respond_json(fd, 200, util::jo([util::kv("available", avail), util::kv("profiles", profiles)]))
+end
+
+pub fn pentest_stream(fd: int, c: [string]) is
+    let tool: string = ctx::bstr(c, "tool")
+    let mut profile: string = ctx::bstr(c, "profile")
+    let target: string = ctx::bstr(c, "target")
+    if !target_ok(target) is
+        http::err(fd, 400, "invalid target")
+        return
+    end
+    audit::log(ctx::user(c), "pentest." + tool, profile + " " + target)
+    if profile == "" is profile = "default" end
+    let args: string = profile_args(tool, profile)
+    sys::sse_begin(fd)
+    if !util::has(["nmap", "nikto", "whois"], tool) is
+        sys::sse_done(fd, false, "unsupported tool")
+        return
+    end
+    if args == "?" is
+        sys::sse_done(fd, false, "unsupported profile \"" + profile + "\" for " + tool)
+        return
+    end
+    if !util::have(tool) is
+        sys::sse_done(fd, false, tool + " is not installed")
+        return
+    end
+    let cmd: string = "timeout " + to_string(config::pentest_timeout()) + " " + tool + (if args == "" then "" else " " + args) + " " + util::sq(target)
+    let full: string = if tool == "nmap" && profile == "ping" then sys::priv(cmd) else cmd
+    sys::stream_cmd_nohdr(fd, full)
+end
