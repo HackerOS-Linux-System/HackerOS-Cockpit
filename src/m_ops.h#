@@ -1,0 +1,417 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod auth
+mod audit
+mod settings
+mod sys
+
+fn clean_abs(p: string) -> string is
+    let r: string = string_trim(p)
+    if r == "" is return "" end
+    return string_trim(shell("realpath -m -- " + util::sq(r) + " 2>/dev/null"))
+end
+
+fn valid_unit(u: string) -> bool is
+    return string_len(u) <= 100 && util::all_in(u, util::alnum() + "@_.:-\\")
+end
+
+fn valid_since(s: string) -> bool is
+    return string_len(s) <= 40 && util::all_in(s, util::alnum() + " :-+")
+end
+
+fn valid_prio(p: string) -> bool is
+    return util::has(["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug", "0", "1", "2", "3", "4", "5", "6", "7"], p)
+end
+
+;; ── logs ─────────────────────────────────────────────────────────────────────
+
+pub fn log_sources(fd: int, c: [string]) is
+    let allowed: [string] = settings::allowed_logs()
+    let mut existing: [string] = []
+    let mut i: int = 0
+    while i < array_len(allowed) is
+        if file_exists(allowed[i]) is existing = array_push(existing, allowed[i]) end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("files", util::jstrs(existing)), util::kv("configured", util::jstrs(allowed)),
+        util::kv("units", util::jstrs(settings::services()))]))
+end
+
+;; Validates the query; returns "" or an error text. Fills `file` via return of
+;; the cleaned path in out[0].
+fn log_query(c: [string]) -> [string] is
+    let unit: string = ctx::q(c, "unit")
+    let prio: string = ctx::q(c, "priority")
+    let since: string = ctx::q(c, "since")
+    let grep: string = ctx::q(c, "grep")
+    let mut file: string = ctx::q(c, "file")
+    if file != "" is
+        file = clean_abs(file)
+        let allowed: [string] = settings::allowed_logs()
+        if !util::has(allowed, file) || (array_len(ctx::scope_list(c, "log_files")) > 0 && !util::has(ctx::scope_list(c, "log_files"), file)) is
+            return ["that file is not in your allowed log list", "", "", "", "", "", ""]
+        end
+    end
+    if unit != "" && !valid_unit(unit) is return ["invalid unit name", "", "", "", "", "", ""] end
+    if since != "" && !valid_since(since) is return ["invalid 'since' value", "", "", "", "", "", ""] end
+    if prio != "" && !valid_prio(prio) is return ["invalid priority", "", "", "", "", "", ""] end
+    if string_len(grep) > 200 is return ["filter too long", "", "", "", "", "", ""] end
+    let mut n: int = util::to_i(ctx::q(c, "lines"))
+    if n <= 0 is n = 200 end
+    if n > 5000 is n = 5000 end
+    return ["", file, unit, prio, since, grep, to_string(n)]
+end
+
+fn journal_cmd(q: [string], follow: bool) -> string is
+    let mut cmd: string = "journalctl --no-pager -o short-iso"
+    if follow is cmd = cmd + " -f -n 0" else is cmd = cmd + " -n " + q[6] end
+    if q[2] != "" is cmd = cmd + " -u " + util::sq(q[2]) end
+    if q[3] != "" is cmd = cmd + " -p " + util::sq(q[3]) end
+    if q[4] != "" is cmd = cmd + " --since " + util::sq(q[4]) end
+    return sys::priv(cmd)
+end
+
+pub fn logs(fd: int, c: [string]) is
+    let q: [string] = log_query(c)
+    if q[0] != "" is
+        http::err(fd, 400, q[0])
+        return
+    end
+    let mut cmd: string = ""
+    let mut source: string = "journal"
+    if q[1] != "" is
+        source = q[1]
+        if !file_exists(q[1]) is
+            http::err(fd, 502, "open " + q[1] + ": no such file or directory")
+            return
+        end
+        if q[5] != "" is
+            cmd = "grep -i -F -- " + util::sq(q[5]) + " " + util::sq(q[1]) + " | tail -n " + q[6]
+        else is
+            cmd = "tail -n " + q[6] + " " + util::sq(q[1])
+        end
+    else is
+        cmd = journal_cmd(q, false)
+        if q[5] != "" is cmd = cmd + " | grep -i -F -- " + util::sq(q[5]) end
+    end
+    let out: string = shell(cmd + " 2>/dev/null" + sys::json_safe())
+    let mut ls: [string] = []
+    let parts: [string] = string_split(out, "\n")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is ls = array_push(ls, parts[i]) end
+        i += 1
+    end
+    audit::log(ctx::user(c), "logs.view", source + " " + q[2])
+    http::respond_json(fd, 200, util::jo([util::ks("source", source), util::kv("lines", util::jstrs(ls))]))
+end
+
+pub fn log_follow(fd: int, c: [string]) is
+    let q: [string] = log_query(c)
+    if q[0] != "" is
+        http::err(fd, 400, q[0])
+        return
+    end
+    audit::log(ctx::user(c), "logs.follow", q[1] + " " + q[2])
+    let mut cmd: string = ""
+    if q[1] != "" is
+        cmd = "tail -n 0 -F " + util::sq(q[1])
+    else is
+        cmd = journal_cmd(q, true)
+    end
+    if q[5] != "" is cmd = cmd + " | grep -i --line-buffered -F -- " + util::sq(q[5]) end
+    sys::stream_cmd(fd, cmd)
+end
+
+;; ── files ────────────────────────────────────────────────────────────────────
+
+fn effective_roots(c: [string]) -> [string] is
+    let global: [string] = settings::file_roots()
+    let scope: [string] = ctx::scope_list(c, "file_roots")
+    if array_len(scope) == 0 is return global end
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(scope) is
+        if auth::in_scope_path(global, [], scope[i]) is out = array_push(out, scope[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn real_roots(roots: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(roots) is
+        let r: string = sys::realpath(roots[i])
+        out = array_push(out, if r == "" then roots[i] else r)
+        i += 1
+    end
+    return out
+end
+
+fn is_denied(real: string) -> bool is
+    let base: string = util::basename(real)
+    if util::has(["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "auth.json", "shadow", "gshadow"], base) is return true end
+    let prefixes: [string] = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh/ssh_host_", "/etc/ssl/private",
+        "/etc/letsencrypt/archive", "/etc/letsencrypt/live/", "/proc/kcore"]
+    let mut i: int = 0
+    while i < array_len(prefixes) is
+        let d: string = prefixes[i]
+        if real == d is return true end
+        if string_starts_with(real, d) is
+            if string_ends_with(d, "/") || string_ends_with(d, "_") is return true end
+            let nx: string = string_at(real, string_len(d))
+            if nx == "/" || nx == "." || nx == "-" is return true end
+        end
+        i += 1
+    end
+    return false
+end
+
+;; ["", real] on success, [errmsg, status] otherwise.
+fn resolve(c: [string], p: string) -> [string] is
+    if p == "" || !string_starts_with(p, "/") is return ["invalid path", "400"] end
+    let real: string = sys::realpath(p)
+    if real == "" || !file_exists(real) is return ["no such file or directory", "404"] end
+    let roots: [string] = real_roots(effective_roots(c))
+    let mut ok: bool = false
+    let mut i: int = 0
+    while i < array_len(roots) is
+        if roots[i] == "/" || real == roots[i] || string_starts_with(real, roots[i] + "/") is ok = true end
+        i += 1
+    end
+    if !ok is return ["path is outside the allowed roots", "403"] end
+    if is_denied(real) is return ["access to this file is blocked by policy", "403"] end
+    return ["", real]
+end
+
+fn human_size(b: int) -> string is
+    if b < 1024 is return to_string(b) + " B" end
+    if b < 1048576 is return util::jtenths(b * 10 / 1024) + " KB" end
+    if b < 1073741824 is return util::jtenths(b * 10 / 1048576) + " MB" end
+    return util::jtenths(b * 10 / 1073741824) + " GB"
+end
+
+pub fn files(fd: int, c: [string]) is
+    let mut p: string = ctx::q(c, "path")
+    if p == "" is
+        let roots: [string] = effective_roots(c)
+        if array_len(roots) == 0 is
+            http::err(fd, 403, "no file root is available to your account")
+            return
+        end
+        p = roots[0]
+    end
+    let r: [string] = resolve(c, p)
+    if r[0] != "" is
+        http::err(fd, util::to_i(r[1]), r[0])
+        return
+    end
+    let real: string = r[1]
+    if !util::is_dir(real) is
+        http::err(fd, 400, "not a directory")
+        return
+    end
+    let cmd: string = "cd " + util::sq(real) + " && TZ=UTC find . -mindepth 1 -maxdepth 1 -printf '%y|%Y|%s|%M|%TY-%Tm-%Td %TH:%TM|%f\\n' 2>/dev/null | " +
+        "awk -F'|' '{{d=($1==\"d\"||($1==\"l\"&&$2==\"d\"))?0:1; print d\"|\"tolower($6)\"|\"$0}}' | LC_ALL=C sort -t'|' -k1,1n -k2,2" + sys::json_safe()
+    let ls: [string] = string_split(shell(cmd), "\n")
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], "|")
+        if array_len(f) >= 8 is
+            let ty: string = f[2]
+            let target: string = f[3]
+            let size: int = util::to_i(f[4])
+            let is_link: bool = ty == "l"
+            let is_dir: bool = ty == "d" || (is_link && target == "d")
+            let mut name: string = f[7]
+            let mut k: int = 8
+            while k < array_len(f) is
+                name = name + "|" + f[k]
+                k += 1
+            end
+            items = array_push(items, util::jo([util::ks("name", name), util::kv("isDir", util::jb(is_dir)), util::kv("isLink", util::jb(is_link)),
+                util::kv("size", util::ji(if is_dir then 0 else size)), util::ks("sizeText", if is_dir then "–" else human_size(size)),
+                util::ks("mode", f[5]), util::ks("modified", f[6])]))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::ks("path", real), util::ks("parent", util::dirname(real)), util::kv("entries", util::ja(items))]))
+end
+
+pub fn file_read_preview(fd: int, c: [string]) is
+    let r: [string] = resolve(c, ctx::q(c, "path"))
+    if r[0] != "" is
+        http::err(fd, util::to_i(r[1]), r[0])
+        return
+    end
+    let real: string = r[1]
+    if util::is_dir(real) is
+        http::err(fd, 400, "is a directory")
+        return
+    end
+    let kind: string = string_trim(shell("[ -f " + util::sq(real) + " ] && echo file"))
+    if kind != "file" is
+        http::err(fd, 400, "not a regular file")
+        return
+    end
+    let a: string = string_trim(shell("head -c 204800 " + util::sq(real) + " | wc -c"))
+    let b: string = string_trim(shell("head -c 204800 " + util::sq(real) + " | tr -d '\\000' | wc -c"))
+    if a != b is
+        http::err(fd, 400, "binary file — preview unavailable")
+        return
+    end
+    let size: int = util::to_i(shell("stat -c %s " + util::sq(real)))
+    let content: string = shell("head -c 204800 " + util::sq(real) + sys::json_safe())
+    audit::log(ctx::user(c), "file.read", real)
+    http::respond_json(fd, 200, util::jo([util::ks("path", real), util::ks("content", content), util::kv("truncated", util::jb(size > util::to_i(a)))]))
+end
+
+pub fn file_download(fd: int, c: [string]) is
+    let r: [string] = resolve(c, ctx::q(c, "path"))
+    if r[0] != "" is
+        http::err(fd, util::to_i(r[1]), r[0])
+        return
+    end
+    let real: string = r[1]
+    if string_trim(shell("[ -f " + util::sq(real) + " ] && echo file")) != "file" is
+        http::err(fd, 400, "not a regular file")
+        return
+    end
+    let size: int = util::to_i(shell("stat -c %s " + util::sq(real)))
+    audit::log(ctx::user(c), "file.download", real)
+    let fname: string = string_replace(util::basename(real), "\"", "_")
+    net::fd_write(fd, http::head_block(200, "application/octet-stream", "Content-Disposition: attachment; filename=\"" + fname + "\"\r\n", size))
+    sys::pipe_raw(fd, "cat -- " + util::sq(real))
+end
+
+;; ── packages ─────────────────────────────────────────────────────────────────
+
+fn valid_pkg(n: string) -> bool is
+    if string_len(n) == 0 || string_len(n) > 100 is return false end
+    if !string_contains("abcdefghijklmnopqrstuvwxyz0123456789", string_at(n, 0)) is return false end
+    return util::all_in(n, "abcdefghijklmnopqrstuvwxyz0123456789+.-:")
+end
+
+pub fn packages(fd: int, c: [string]) is
+    if !util::have("dpkg-query") is
+        http::err(fd, 502, "dpkg-query unavailable")
+        return
+    end
+    let q: string = string_lower(ctx::q(c, "q"))
+    let off0: int = util::to_i(ctx::q(c, "offset"))
+    let mut lim: int = util::to_i(ctx::q(c, "limit"))
+    if lim <= 0 || lim > 500 is lim = 100 end
+    let filt: string = if q == "" then "cat" else "grep -i -F -- " + util::sq(q)
+    let out: string = shell("dpkg-query -W -f='${{db:Status-Abbrev}}\\t${{Package}}\\t${{Version}}\\t${{binary:Summary}}\\n' 2>/dev/null | grep '^ii' | " + filt +
+        " | LC_ALL=C sort -t'\t' -k2,2" + sys::json_safe())
+    let ls: [string] = string_split(out, "\n")
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], "\t")
+        if array_len(f) >= 3 is
+            let mut pairs: [string] = [util::ks("name", f[1]), util::ks("version", f[2])]
+            if array_len(f) >= 4 && f[3] != "" is pairs = array_push(pairs, util::ks("summary", f[3])) end
+            rows = array_push(rows, util::jo(pairs))
+        end
+        i += 1
+    end
+    let total: int = array_len(rows)
+    let mut off: int = off0
+    if off < 0 is off = 0 end
+    if off > total is off = total end
+    let mut page: [string] = []
+    let mut j: int = off
+    while j < total && j < off + lim is
+        page = array_push(page, rows[j])
+        j += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("packages", util::ja(page)), util::kv("total", util::ji(total))]))
+end
+
+pub fn packages_search(fd: int, c: [string]) is
+    let q: string = ctx::q(c, "q")
+    if string_len(q) < 2 || string_len(q) > 60 || !util::all_in(q, util::alnum() + "_.+-") is
+        http::err(fd, 400, "invalid search term")
+        return
+    end
+    let out: string = shell("apt-cache search --names-only " + util::sq(q) + " 2>/dev/null | head -n 60" + sys::json_safe())
+    let ls: [string] = string_split(out, "\n")
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let cut: int = string_find(ls[i], " - ")
+        if cut > 0 is
+            rows = array_push(rows, util::jo([util::ks("name", string_slice(ls[i], 0, cut)), util::ks("version", ""),
+                util::ks("summary", string_slice(ls[i], cut + 3, string_len(ls[i])))]))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("packages", util::ja(rows))]))
+end
+
+pub fn packages_upgradable(fd: int, c: [string]) is
+    let out: string = shell("LC_ALL=C apt list --upgradable 2>/dev/null")
+    let ls: [string] = string_split(out, "\n")
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let l: string = ls[i]
+        let sl: int = string_find(l, "/")
+        let up: int = string_find(l, "[upgradable from: ")
+        if sl > 0 && up > 0 is
+            let name: string = string_slice(l, 0, sl)
+            let rest: [string] = util::split_clean(string_slice(l, sl + 1, up), " ")
+            let cur: string = string_replace(string_slice(l, up + 18, string_len(l)), "]", "")
+            if array_len(rest) >= 2 is
+                rows = array_push(rows, util::jo([util::ks("name", name), util::ks("current", cur), util::ks("candidate", rest[1]), util::ks("source", rest[0])]))
+            end
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("upgradable", util::ja(rows))]))
+end
+
+pub fn package_info(fd: int, c: [string]) is
+    let n: string = ctx::q(c, "name")
+    if !valid_pkg(n) is
+        http::err(fd, 400, "invalid package name")
+        return
+    end
+    let out: string = shell("apt-cache show " + util::sq(n) + " 2>/dev/null" + sys::json_safe())
+    if string_trim(out) == "" is
+        http::err(fd, 400, "package not found")
+        return
+    end
+    let cut: int = string_find(out, "\n\n")
+    http::respond_json(fd, 200, util::jo([util::ks("info", if cut > 0 then string_slice(out, 0, cut) else out)]))
+end
+
+fn pkg_args(action: string, name: string) -> string is
+    let need: bool = action == "install" || action == "remove" || action == "purge"
+    if need && !valid_pkg(name) is return "" end
+    if need is return action + " -y -- " + util::sq(name) end
+    if action == "update" is return "update" end
+    if action == "upgrade" is return "upgrade -y" end
+    if action == "autoremove" is return "autoremove -y" end
+    return ""
+end
+
+pub fn packages_stream(fd: int, c: [string]) is
+    let action: string = ctx::bstr(c, "action")
+    let name: string = ctx::bstr(c, "name")
+    let args: string = pkg_args(action, name)
+    if args == "" is
+        http::err(fd, 400, if action == "install" || action == "remove" || action == "purge" then "invalid package name" else "invalid action")
+        return
+    end
+    audit::log(ctx::user(c), "package." + action, string_trim(name))
+    let env: string = "DEBIAN_FRONTEND=noninteractive LC_ALL=C"
+    let cmd: string = if util::is_root() then "env " + env + " apt-get " + args else "sudo -n env " + env + " apt-get " + args
+    sys::stream_cmd(fd, cmd)
+end
