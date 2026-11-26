@@ -1,0 +1,231 @@
+mod util
+mod http
+mod ctx
+mod config
+mod audit
+mod notify
+mod sys
+
+fn domain_ok(d: string) -> bool is
+    if string_len(d) > 253 || string_len(d) < 4 is return false end
+    let base: string = if string_starts_with(d, "*.") then string_slice(d, 2, string_len(d)) else d
+    if !util::all_in(base, util::alnum() + ".-") || string_find(base, ".") < 1 is return false end
+    return !string_starts_with(base, ".") && !string_starts_with(base, "-") && !string_ends_with(base, ".") && !string_ends_with(base, "-")
+end
+
+fn name_ok(n: string) -> bool is
+    if string_len(n) < 1 || string_len(n) > 61 is return false end
+    return string_contains(util::alnum(), string_at(n, 0)) && util::all_in(n, util::alnum() + "._-")
+end
+
+;; JSON object for one PEM file, "" when it holds no certificate.
+fn describe(path: string) -> string is
+    let out: string = shell("openssl x509 -in " + util::sq(path) + " -noout -subject -issuer -startdate -enddate -ext subjectAltName -nameopt RFC2253 2>/dev/null")
+    if string_trim(out) == "" is return "" end
+    let ls: [string] = string_split(out, "\n")
+    let mut subject: string = ""
+    let mut issuer: string = ""
+    let mut nb: string = ""
+    let mut na: string = ""
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let l: string = string_trim(ls[i])
+        if string_starts_with(l, "subject=") is subject = string_trim(string_slice(l, 8, string_len(l))) end
+        if string_starts_with(l, "issuer=") is issuer = string_trim(string_slice(l, 7, string_len(l))) end
+        if string_starts_with(l, "notBefore=") is nb = string_trim(string_slice(l, 10, string_len(l))) end
+        if string_starts_with(l, "notAfter=") is na = string_trim(string_slice(l, 9, string_len(l))) end
+        if string_contains(l, "DNS:") || string_contains(l, "IP Address:") is
+            let parts: [string] = util::split_clean(l, ",")
+            let mut k: int = 0
+            while k < array_len(parts) is
+                let p: string = string_trim(parts[k])
+                if string_starts_with(p, "DNS:") is names = array_push(names, string_slice(p, 4, string_len(p))) end
+                if string_starts_with(p, "IP Address:") is names = array_push(names, string_slice(p, 11, string_len(p))) end
+                k += 1
+            end
+        end
+        i += 1
+    end
+    let cn: string = cn_of(subject)
+    let iss_cn: string = cn_of(issuer)
+    let na_iso: string = string_trim(shell("date -u -d " + util::sq(na) + " +%Y-%m-%d 2>/dev/null"))
+    let nb_iso: string = string_trim(shell("date -u -d " + util::sq(nb) + " +%Y-%m-%d 2>/dev/null"))
+    let end_unix: int = util::to_i(shell("date -u -d " + util::sq(na) + " +%s 2>/dev/null"))
+    let secs: int = end_unix - now_unix()
+    let days: int = if secs >= 0 then secs / 86400 else 0 - ((0 - secs) / 86400)
+    return util::jo([util::ks("path", path), util::ks("subject", cn), util::ks("issuer", iss_cn), util::kv("names", util::jstrs(names)),
+        util::ks("not_before", nb_iso), util::ks("not_after", na_iso), util::kv("days_left", util::ji(days)),
+        util::kv("self_signed", util::jb(subject == issuer)), util::kv("expired", util::jb(secs < 0))])
+end
+
+fn cn_of(dn: string) -> string is
+    let parts: [string] = string_split(dn, ",")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let p: string = string_trim(parts[i])
+        if string_starts_with(p, "CN=") is return string_slice(p, 3, string_len(p)) end
+        i += 1
+    end
+    return dn
+end
+
+;; Scans the cert dirs (depth ≤ 3) → array of JSON, soonest-expiring first.
+pub fn scan() -> [string] is
+    let dirs: [string] = config::cert_dirs()
+    let mut seen: [string] = []
+    let mut items: [string] = []
+    let mut d: int = 0
+    while d < array_len(dirs) is
+        if util::is_dir(dirs[d]) is
+            let files: [string] = util::split_clean(shell("find -L " + util::sq(dirs[d]) + " -maxdepth 3 -type f \\( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' \\) 2>/dev/null"), "\n")
+            let mut i: int = 0
+            while i < array_len(files) is
+                let p: string = files[i]
+                let base: string = util::basename(p)
+                let real: string = sys::realpath(p)
+                let dir_seen: bool = util::has(seen, util::dirname(p))
+                if base != "privkey.pem" && base != "chain.pem" && !(base == "cert.pem" && dir_seen) && !util::has(seen, real) is
+                    let j: string = describe(p)
+                    if j != "" is
+                        seen = array_push(array_push(seen, real), util::dirname(p))
+                        items = array_push(items, j)
+                    end
+                end
+                i += 1
+            end
+        end
+        d += 1
+    end
+    ;; insertion sort by days_left
+    let mut k: int = 1
+    while k < array_len(items) is
+        let cur: string = items[k]
+        let mut m: int = k - 1
+        while m >= 0 && util::jint(items[m], "days_left") > util::jint(cur, "days_left") is
+            items[m + 1] = items[m]
+            m -= 1
+        end
+        items[m + 1] = cur
+        k += 1
+    end
+    return items
+end
+
+pub fn certs(fd: int, c: [string]) is
+    http::respond_json(fd, 200, util::jo([util::kv("certs", util::ja(scan())), util::kv("dirs", util::jstrs(config::cert_dirs())),
+        util::kv("certbot", util::jb(util::have("certbot"))), util::kv("panel_tls", util::jb(config::tls_cert() != "")),
+        util::ks("panel_cert", config::tls_cert())]))
+end
+
+;; Called by the background watcher.
+pub fn check_expiry() is
+    let items: [string] = scan()
+    let mut i: int = 0
+    while i < array_len(items) is
+        notify::check_cert(util::jstr(items[i], "subject"), util::jint(items[i], "days_left"))
+        i += 1
+    end
+end
+
+pub fn selfsigned(fd: int, c: [string]) is
+    let b: string = ctx::body(c)
+    let name: string = util::jstr(b, "name")
+    if !name_ok(name) is
+        http::err(fd, 400, "invalid certificate name")
+        return
+    end
+    let mut days: int = util::jint(b, "days")
+    if days < 1 || days > 3650 is days = 365 end
+    let mut hosts: [string] = util::jstr_list(b, "hosts")
+    if array_len(hosts) == 0 is hosts = ["localhost"] end
+    let mut san: [string] = []
+    let mut i: int = 0
+    while i < array_len(hosts) is
+        let h: string = string_trim(hosts[i])
+        if util::all_in(h, "0123456789.") && string_find(h, ".") > 0 is
+            san = array_push(san, "IP:" + h)
+        else if util::all_in(h, "0123456789abcdefABCDEF:") && string_contains(h, ":") is
+            san = array_push(san, "IP:" + h)
+        else if domain_ok(h) || h == "localhost" is
+            san = array_push(san, "DNS:" + h)
+        else is
+            http::err(fd, 400, "invalid host name: " + h)
+            return
+        end
+        i += 1
+    end
+    let dir: string = config::data_dir() + "/certs/" + name
+    shell("mkdir -p " + util::sq(dir) + " && chmod 700 " + util::sq(dir))
+    let r: [string] = sys::run_rc("openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days " + to_string(days) +
+        " -subj " + util::sq("/CN=" + string_trim(hosts[0]) + "/O=HackerCockpit") + " -addext " + util::sq("subjectAltName=" + util::join(san, ",")) +
+        " -keyout " + util::sq(dir + "/key.pem") + " -out " + util::sq(dir + "/cert.pem"))
+    if r[1] != "0" is
+        http::err(fd, 400, "openssl: " + string_trim(r[0]))
+        return
+    end
+    shell("chmod 600 " + util::sq(dir + "/key.pem") + "; chmod 644 " + util::sq(dir + "/cert.pem"))
+    audit::log(ctx::user(c), "cert.selfsigned", name)
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("cert", dir + "/cert.pem"), util::ks("key", dir + "/key.pem"),
+        util::ks("message", "To serve the panel over HTTPS put nginx/caddy in front (see deploy/) and point it at these files.")]))
+end
+
+pub fn certbot_stream(fd: int, c: [string]) is
+    let b: string = ctx::body(c)
+    let domains: [string] = util::jstr_list(b, "domains")
+    let email: string = util::jstr(b, "email")
+    let mode: string = util::jstr(b, "mode")
+    let webroot: string = util::jstr(b, "webroot")
+    if array_len(domains) == 0 || array_len(domains) > 20 is
+        http::err(fd, 400, "1–20 domains required")
+        return
+    end
+    let mut i: int = 0
+    while i < array_len(domains) is
+        if !domain_ok(domains[i]) is
+            http::err(fd, 400, "invalid domain: " + domains[i])
+            return
+        end
+        i += 1
+    end
+    if !notify::email_valid_addr(email) is
+        http::err(fd, 400, "a valid contact e-mail is required")
+        return
+    end
+    let mut args: string = "certonly --non-interactive --agree-tos -m " + util::sq(email)
+    if mode == "webroot" is
+        if !string_starts_with(webroot, "/") || string_contains(webroot, " ") || string_contains(webroot, "\n") is
+            http::err(fd, 400, "webroot must be an absolute path without spaces")
+            return
+        end
+        args = args + " --webroot -w " + util::sq(webroot)
+    else if mode == "standalone" || mode == "" is
+        args = args + " --standalone"
+    else is
+        http::err(fd, 400, "mode must be standalone or webroot")
+        return
+    end
+    i = 0
+    while i < array_len(domains) is
+        args = args + " -d " + util::sq(domains[i])
+        i += 1
+    end
+    if util::jbool(b, "dry_run") is args = args + " --dry-run" end
+    audit::log(ctx::user(c), "cert.certbot", domains[array_len(domains) - 1])
+    if !util::have("certbot") is
+        sys::sse_begin(fd)
+        sys::sse_done(fd, false, "certbot is not installed")
+        return
+    end
+    sys::stream_cmd(fd, sys::priv("certbot " + args))
+end
+
+pub fn renew_stream(fd: int, c: [string]) is
+    audit::log(ctx::user(c), "cert.renew", "")
+    if !util::have("certbot") is
+        sys::sse_begin(fd)
+        sys::sse_done(fd, false, "certbot is not installed")
+        return
+    end
+    sys::stream_cmd(fd, sys::priv("certbot renew --non-interactive" + (if util::jbool(ctx::body(c), "dry_run") then " --dry-run" else "")))
+end
