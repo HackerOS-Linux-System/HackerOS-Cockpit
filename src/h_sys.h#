@@ -1,0 +1,110 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod audit
+mod system
+mod settings
+mod auth
+mod sys
+
+;; ── SSE ──────────────────────────────────────────────────────────────────────
+
+pub fn system_stream(fd: int) is
+    let hdr: string = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n" +
+                      "Connection: keep-alive\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\n" +
+                      "X-Frame-Options: DENY\r\n\r\n"
+    if !net::fd_write(fd, hdr) is return end
+    while true is
+        let json: string = system::collect_json()
+        if !net::fd_write(fd, "event: system\ndata: " + json + "\n\n") is return end
+        sleep_ms(2750)
+    end
+end
+
+;; ── services ─────────────────────────────────────────────────────────────────
+
+pub fn valid_service(name: string) -> bool is
+    let n: int = string_len(name)
+    if n == 0 || n > 100 || string_starts_with(name, "-") is return false end
+    return util::all_in(name, util::alnum() + "@_.-")
+end
+
+fn show_value(out: string, key: string) -> string is
+    let ls: [string] = string_split(out, "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let eq: int = string_find(ls[i], "=")
+        if eq > 0 && string_slice(ls[i], 0, eq) == key is return string_slice(ls[i], eq + 1, string_len(ls[i])) end
+        i += 1
+    end
+    return ""
+end
+
+pub fn service_info(name: string) -> string is
+    if !valid_service(name) is
+        return util::jo([util::ks("name", name), util::kv("active", "false"), util::ks("state", "invalid"),
+            util::ks("sub", ""), util::ks("enabled", "unknown"), util::ks("description", ""),
+            util::ks("since", ""), util::ks("main_pid", ""), util::ks("memory", "")])
+    end
+    let out: string = shell("timeout 5 systemctl show " + util::sq(name) +
+        " --no-pager --property=ActiveState,SubState,UnitFileState,LoadState,Description,ActiveEnterTimestamp,MainPID,MemoryCurrent 2>/dev/null")
+    let mut state: string = show_value(out, "ActiveState")
+    if state == "" is state = "unknown" end
+    let mut enabled: string = show_value(out, "UnitFileState")
+    if show_value(out, "LoadState") == "not-found" is enabled = "not-found" end
+    if enabled == "" is enabled = "unknown" end
+    let mut pid: string = show_value(out, "MainPID")
+    if pid == "0" is pid = "" end
+    let mut mem: string = show_value(out, "MemoryCurrent")
+    if string_starts_with(mem, "[") || mem == "18446744073709551615" is mem = "" end
+    return util::jo([util::ks("name", name), util::kv("active", util::jb(state == "active")), util::ks("state", state),
+        util::ks("sub", show_value(out, "SubState")), util::ks("enabled", enabled),
+        util::ks("description", show_value(out, "Description")), util::ks("since", show_value(out, "ActiveEnterTimestamp")),
+        util::ks("main_pid", pid), util::ks("memory", mem)])
+end
+
+pub fn services(fd: int, c: [string]) is
+    let names: [string] = auth::intersect(settings::services(), ctx::scope_list(c, "services"))
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < array_len(names) is
+        items = array_push(items, service_info(names[i]))
+        i += 1
+    end
+    http::respond_json(fd, 200, "{{\"services\":" + util::ja(items) + "}}")
+end
+
+fn priv(cmd: string) -> string is
+    if util::is_root() is return cmd end
+    return "sudo -n " + cmd
+end
+
+pub fn service_action(fd: int, c: [string]) is
+    let name: string = ctx::bstr(c, "name")
+    let action: string = ctx::bstr(c, "action")
+    if !util::has(auth::intersect(settings::services(), ctx::scope_list(c, "services")), name) is
+        http::err(fd, 403, "service is not in your allowed list (Settings → Managed services / your account's scope)")
+        return
+    end
+    if !valid_service(name) is
+        http::err(fd, 502, "invalid service name")
+        return
+    end
+    if !util::has(["start", "stop", "restart", "reload", "enable", "disable"], action) is
+        http::err(fd, 502, "invalid action")
+        return
+    end
+    let out: string = shell("timeout 30 " + priv("systemctl " + action + " " + util::sq(name)) + " 2>&1; echo \"rc=$?\"")
+    let rc: int = string_rfind(out, "rc=")
+    let code: string = if rc >= 0 then string_trim(string_slice(out, rc + 3, string_len(out))) else "1"
+    if code != "0" is
+        let msg: string = if rc >= 0 then string_trim(string_slice(out, 0, rc)) else out
+        http::err(fd, 502, "exit status " + code + ": " + msg)
+        return
+    end
+    audit::log(ctx::user(c), "service." + action, name)
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("message", name + ": " + action + " done"),
+        util::kv("service", service_info(name))]))
+end
