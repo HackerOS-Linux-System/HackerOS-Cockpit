@@ -1,0 +1,608 @@
+pub fn str_bytes(s: string) -> [int] is
+    let n: int = string_len(s)
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        out = array_push(out, str_to_char_code(string_at(s, i)) & 255)
+        i += 1
+    end
+    return out
+end
+
+pub fn hex_of(b: [int]) -> string is
+    let digits: string = "0123456789abcdef"
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(b) is
+        let v: int = b[i] & 255
+        out = out + string_at(digits, v >> 4) + string_at(digits, v & 15)
+        i += 1
+    end
+    return out
+end
+
+;; Native H# arrays are shared handles and `array_push` / `a[i] = x` mutate in place,
+;; so a plain `let mut b = a` ALIASES `a`. Always copy before mutating an argument.
+pub fn copy_ints(a: [int]) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < array_len(a) is
+        out = array_push(out, a[i])
+        i += 1
+    end
+    return out
+end
+
+fn hex_val(c: string) -> int is
+    let p: int = string_find("0123456789abcdef", string_lower(c))
+    return p
+end
+
+pub fn bytes_of_hex(h: string) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i + 1 < string_len(h) is
+        let a: int = hex_val(string_at(h, i))
+        let b: int = hex_val(string_at(h, i + 1))
+        if a < 0 || b < 0 is return [] end
+        out = array_push(out, a * 16 + b)
+        i += 2
+    end
+    return out
+end
+
+;; Constant-time comparison of two byte arrays.
+pub fn ct_eq(a: [int], b: [int]) -> bool is
+    if array_len(a) != array_len(b) is return false end
+    let mut diff: int = 0
+    let mut i: int = 0
+    while i < array_len(a) is
+        diff = diff | (a[i] ^ b[i])
+        i += 1
+    end
+    return diff == 0
+end
+
+pub fn ct_eq_str(a: string, b: string) -> bool is
+    return ct_eq(str_bytes(a), str_bytes(b))
+end
+
+;; ── SHA-256 ──────────────────────────────────────────────────────────────────
+
+fn k256() -> [int] is
+    return [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+        3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+        3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+        666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+        2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+        1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298
+    ]
+end
+
+fn rotr32(x: int, n: int) -> int is
+    return ((x >> n) | (x << (32 - n))) & 4294967295
+end
+
+;; Full SHA-256 of a byte array -> 32 bytes.
+pub fn sha256(msg: [int]) -> [int] is
+    let k: [int] = k256()
+    let mut h: [int] = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+
+    ;; padding
+    let bitlen: int = array_len(msg) * 8
+    let mut data: [int] = copy_ints(msg)
+    data = array_push(data, 128)
+    while array_len(data) % 64 != 56 is
+        data = array_push(data, 0)
+    end
+    let mut s: int = 7
+    while s >= 0 is
+        data = array_push(data, (bitlen >> (s * 8)) & 255)
+        s -= 1
+    end
+
+    let mut w: [int] = []
+    let mut t0: int = 0
+    while t0 < 64 is
+        w = array_push(w, 0)
+        t0 += 1
+    end
+
+    let mut off: int = 0
+    while off < array_len(data) is
+        let mut t: int = 0
+        while t < 16 is
+            let j: int = off + t * 4
+            w[t] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]
+            t += 1
+        end
+        while t < 64 is
+            let x15: int = w[t - 15]
+            let x2: int = w[t - 2]
+            let s0: int = rotr32(x15, 7) ^ rotr32(x15, 18) ^ (x15 >> 3)
+            let s1: int = rotr32(x2, 17) ^ rotr32(x2, 19) ^ (x2 >> 10)
+            w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & 4294967295
+            t += 1
+        end
+        let mut a: int = h[0]
+        let mut b: int = h[1]
+        let mut c: int = h[2]
+        let mut d: int = h[3]
+        let mut e: int = h[4]
+        let mut f: int = h[5]
+        let mut g: int = h[6]
+        let mut hh: int = h[7]
+        let mut r: int = 0
+        while r < 64 is
+            let bs1: int = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+            let ch: int = (e & f) ^ ((e ^ 4294967295) & g)
+            let temp1: int = (hh + bs1 + ch + k[r] + w[r]) & 4294967295
+            let bs0: int = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+            let maj: int = (a & b) ^ (a & c) ^ (b & c)
+            let temp2: int = (bs0 + maj) & 4294967295
+            hh = g
+            g = f
+            f = e
+            e = (d + temp1) & 4294967295
+            d = c
+            c = b
+            b = a
+            a = (temp1 + temp2) & 4294967295
+            r += 1
+        end
+        h[0] = (h[0] + a) & 4294967295
+        h[1] = (h[1] + b) & 4294967295
+        h[2] = (h[2] + c) & 4294967295
+        h[3] = (h[3] + d) & 4294967295
+        h[4] = (h[4] + e) & 4294967295
+        h[5] = (h[5] + f) & 4294967295
+        h[6] = (h[6] + g) & 4294967295
+        h[7] = (h[7] + hh) & 4294967295
+        off += 64
+    end
+
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 8 is
+        out = array_push(out, (h[i] >> 24) & 255)
+        out = array_push(out, (h[i] >> 16) & 255)
+        out = array_push(out, (h[i] >> 8) & 255)
+        out = array_push(out, h[i] & 255)
+        i += 1
+    end
+    return out
+end
+
+pub fn sha256_hex(s: string) -> string is
+    return hex_of(sha256(str_bytes(s)))
+end
+
+;; ── SHA-1 (only for TOTP, RFC 6238 mandates it) ──────────────────────────────
+
+fn rotl32(x: int, n: int) -> int is
+    return ((x << n) | (x >> (32 - n))) & 4294967295
+end
+
+pub fn sha1(msg: [int]) -> [int] is
+    let mut h0: int = 1732584193
+    let mut h1: int = 4023233417
+    let mut h2: int = 2562383102
+    let mut h3: int = 271733878
+    let mut h4: int = 3285377520
+    let bitlen: int = array_len(msg) * 8
+    let mut data: [int] = copy_ints(msg)
+    data = array_push(data, 128)
+    while array_len(data) % 64 != 56 is
+        data = array_push(data, 0)
+    end
+    let mut s: int = 7
+    while s >= 0 is
+        data = array_push(data, (bitlen >> (s * 8)) & 255)
+        s -= 1
+    end
+    let mut w: [int] = []
+    let mut t0: int = 0
+    while t0 < 80 is
+        w = array_push(w, 0)
+        t0 += 1
+    end
+    let mut off: int = 0
+    while off < array_len(data) is
+        let mut t: int = 0
+        while t < 16 is
+            let j: int = off + t * 4
+            w[t] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]
+            t += 1
+        end
+        while t < 80 is
+            w[t] = rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1)
+            t += 1
+        end
+        let mut a: int = h0
+        let mut b: int = h1
+        let mut c: int = h2
+        let mut d: int = h3
+        let mut e: int = h4
+        let mut i: int = 0
+        while i < 80 is
+            let mut f: int = 0
+            let mut kk: int = 0
+            if i < 20 is
+                f = (b & c) | ((b ^ 4294967295) & d)
+                kk = 1518500249
+            else if i < 40 is
+                f = b ^ c ^ d
+                kk = 1859775393
+            else if i < 60 is
+                f = (b & c) | (b & d) | (c & d)
+                kk = 2400959708
+            else is
+                f = b ^ c ^ d
+                kk = 3395469782
+            end
+            let temp: int = (rotl32(a, 5) + f + e + kk + w[i]) & 4294967295
+            e = d
+            d = c
+            c = rotl32(b, 30)
+            b = a
+            a = temp
+            i += 1
+        end
+        h0 = (h0 + a) & 4294967295
+        h1 = (h1 + b) & 4294967295
+        h2 = (h2 + c) & 4294967295
+        h3 = (h3 + d) & 4294967295
+        h4 = (h4 + e) & 4294967295
+        off += 64
+    end
+    let hs: [int] = [h0, h1, h2, h3, h4]
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 5 is
+        out = array_push(out, (hs[i] >> 24) & 255)
+        out = array_push(out, (hs[i] >> 16) & 255)
+        out = array_push(out, (hs[i] >> 8) & 255)
+        out = array_push(out, hs[i] & 255)
+        i += 1
+    end
+    return out
+end
+
+;; ── HMAC ─────────────────────────────────────────────────────────────────────
+
+fn xor_pad(key: [int], pad: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 64 is
+        let kb: int = if i < array_len(key) then key[i] else 0
+        out = array_push(out, kb ^ pad)
+        i += 1
+    end
+    return out
+end
+
+pub fn hmac_sha256(key: [int], msg: [int]) -> [int] is
+    let mut k: [int] = copy_ints(key)
+    if array_len(k) > 64 is k = sha256(k) end
+    let inner: [int] = sha256(array_concat(xor_pad(k, 54), msg))
+    return sha256(array_concat(xor_pad(k, 92), inner))
+end
+
+pub fn hmac_sha1(key: [int], msg: [int]) -> [int] is
+    let mut k: [int] = copy_ints(key)
+    if array_len(k) > 64 is k = sha1(k) end
+    let inner: [int] = sha1(array_concat(xor_pad(k, 54), msg))
+    return sha1(array_concat(xor_pad(k, 92), inner))
+end
+
+;; ── PBKDF2-HMAC-SHA256 ───────────────────────────────────────────────────────
+;; The HMAC pads are hashed once per call (key schedule reuse), so an iteration
+;; costs two compression rounds instead of four.
+
+fn sha256_from_state(state: [int], tail: [int], prefix_len: int) -> [int] is
+    ;; SHA-256 continuing from a saved chaining state; `tail` is the remaining
+    ;; message (< 64 bytes here), `prefix_len` the bytes already compressed.
+    let k: [int] = k256()
+    let mut h: [int] = []
+    let mut q: int = 0
+    while q < 8 is
+        h = array_push(h, state[q])
+        q += 1
+    end
+    let bitlen: int = (prefix_len + array_len(tail)) * 8
+    let mut data: [int] = copy_ints(tail)
+    data = array_push(data, 128)
+    while array_len(data) % 64 != 56 is
+        data = array_push(data, 0)
+    end
+    let mut s: int = 7
+    while s >= 0 is
+        data = array_push(data, (bitlen >> (s * 8)) & 255)
+        s -= 1
+    end
+    return sha256_blocks(h, data, k)
+end
+
+fn sha256_blocks(h0: [int], data: [int], k: [int]) -> [int] is
+    let mut h: [int] = copy_ints(h0)
+    let mut w: [int] = []
+    let mut t0: int = 0
+    while t0 < 64 is
+        w = array_push(w, 0)
+        t0 += 1
+    end
+    let mut off: int = 0
+    while off < array_len(data) is
+        let mut t: int = 0
+        while t < 16 is
+            let j: int = off + t * 4
+            w[t] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]
+            t += 1
+        end
+        while t < 64 is
+            let x15: int = w[t - 15]
+            let x2: int = w[t - 2]
+            let s0: int = rotr32(x15, 7) ^ rotr32(x15, 18) ^ (x15 >> 3)
+            let s1: int = rotr32(x2, 17) ^ rotr32(x2, 19) ^ (x2 >> 10)
+            w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & 4294967295
+            t += 1
+        end
+        let mut a: int = h[0]
+        let mut b: int = h[1]
+        let mut c: int = h[2]
+        let mut d: int = h[3]
+        let mut e: int = h[4]
+        let mut f: int = h[5]
+        let mut g: int = h[6]
+        let mut hh: int = h[7]
+        let mut r: int = 0
+        while r < 64 is
+            let bs1: int = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+            let ch: int = (e & f) ^ ((e ^ 4294967295) & g)
+            let temp1: int = (hh + bs1 + ch + k[r] + w[r]) & 4294967295
+            let bs0: int = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+            let maj: int = (a & b) ^ (a & c) ^ (b & c)
+            let temp2: int = (bs0 + maj) & 4294967295
+            hh = g
+            g = f
+            f = e
+            e = (d + temp1) & 4294967295
+            d = c
+            c = b
+            b = a
+            a = (temp1 + temp2) & 4294967295
+            r += 1
+        end
+        h[0] = (h[0] + a) & 4294967295
+        h[1] = (h[1] + b) & 4294967295
+        h[2] = (h[2] + c) & 4294967295
+        h[3] = (h[3] + d) & 4294967295
+        h[4] = (h[4] + e) & 4294967295
+        h[5] = (h[5] + f) & 4294967295
+        h[6] = (h[6] + g) & 4294967295
+        h[7] = (h[7] + hh) & 4294967295
+        off += 64
+    end
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 8 is
+        out = array_push(out, (h[i] >> 24) & 255)
+        out = array_push(out, (h[i] >> 16) & 255)
+        out = array_push(out, (h[i] >> 8) & 255)
+        out = array_push(out, h[i] & 255)
+        i += 1
+    end
+    return out
+end
+
+;; chaining state after compressing one 64-byte block from the IV
+fn sha256_state_after_block(block: [int]) -> [int] is
+    let k: [int] = k256()
+    let iv: [int] = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    let mut h: [int] = copy_ints(iv)
+    let mut w: [int] = []
+    let mut t0: int = 0
+    while t0 < 64 is
+        w = array_push(w, 0)
+        t0 += 1
+    end
+    let mut t: int = 0
+    while t < 16 is
+        let j: int = t * 4
+        w[t] = (block[j] << 24) | (block[j + 1] << 16) | (block[j + 2] << 8) | block[j + 3]
+        t += 1
+    end
+    while t < 64 is
+        let x15: int = w[t - 15]
+        let x2: int = w[t - 2]
+        let s0: int = rotr32(x15, 7) ^ rotr32(x15, 18) ^ (x15 >> 3)
+        let s1: int = rotr32(x2, 17) ^ rotr32(x2, 19) ^ (x2 >> 10)
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & 4294967295
+        t += 1
+    end
+    let mut a: int = h[0]
+    let mut b: int = h[1]
+    let mut c: int = h[2]
+    let mut d: int = h[3]
+    let mut e: int = h[4]
+    let mut f: int = h[5]
+    let mut g: int = h[6]
+    let mut hh: int = h[7]
+    let mut r: int = 0
+    while r < 64 is
+        let bs1: int = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch: int = (e & f) ^ ((e ^ 4294967295) & g)
+        let temp1: int = (hh + bs1 + ch + k[r] + w[r]) & 4294967295
+        let bs0: int = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj: int = (a & b) ^ (a & c) ^ (b & c)
+        let temp2: int = (bs0 + maj) & 4294967295
+        hh = g
+        g = f
+        f = e
+        e = (d + temp1) & 4294967295
+        d = c
+        c = b
+        b = a
+        a = (temp1 + temp2) & 4294967295
+        r += 1
+    end
+    h[0] = (h[0] + a) & 4294967295
+    h[1] = (h[1] + b) & 4294967295
+    h[2] = (h[2] + c) & 4294967295
+    h[3] = (h[3] + d) & 4294967295
+    h[4] = (h[4] + e) & 4294967295
+    h[5] = (h[5] + f) & 4294967295
+    h[6] = (h[6] + g) & 4294967295
+    h[7] = (h[7] + hh) & 4294967295
+    return h
+end
+
+;; HMAC with precomputed inner/outer states (each a 64-byte-block prefix).
+fn hmac_fast(istate: [int], ostate: [int], msg: [int]) -> [int] is
+    let inner: [int] = sha256_from_state(istate, msg, 64)
+    return sha256_from_state(ostate, inner, 64)
+end
+
+pub fn pbkdf2_sha256(password: [int], salt: [int], iterations: int, key_len: int) -> [int] is
+    let mut key: [int] = copy_ints(password)
+    if array_len(key) > 64 is key = sha256(key) end
+    let istate: [int] = sha256_state_after_block(xor_pad(key, 54))
+    let ostate: [int] = sha256_state_after_block(xor_pad(key, 92))
+    let blocks: int = (key_len + 31) / 32
+    let mut dk: [int] = []
+    let mut block: int = 1
+    while block <= blocks is
+        let mut msg: [int] = copy_ints(salt)
+        msg = array_push(msg, (block >> 24) & 255)
+        msg = array_push(msg, (block >> 16) & 255)
+        msg = array_push(msg, (block >> 8) & 255)
+        msg = array_push(msg, block & 255)
+        let mut u: [int] = hmac_fast(istate, ostate, msg)
+        let mut t: [int] = copy_ints(u)
+        let mut n: int = 2
+        while n <= iterations is
+            u = hmac_fast(istate, ostate, u)
+            let mut x: int = 0
+            while x < 32 is
+                t[x] = t[x] ^ u[x]
+                x += 1
+            end
+            n += 1
+        end
+        dk = array_concat(dk, t)
+        block += 1
+    end
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < key_len is
+        out = array_push(out, dk[i])
+        i += 1
+    end
+    return out
+end
+
+;; ── base64 (std, no padding) / base64url / base32 ───────────────────────────
+
+fn b64_alphabet() -> string is
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+end
+
+pub fn b64_encode_raw(b: [int]) -> string is
+    let al: string = b64_alphabet()
+    let mut out: string = ""
+    let n: int = array_len(b)
+    let mut i: int = 0
+    while i < n is
+        let b0: int = b[i]
+        let b1: int = if i + 1 < n then b[i + 1] else 0
+        let b2: int = if i + 2 < n then b[i + 2] else 0
+        out = out + string_at(al, b0 >> 2)
+        out = out + string_at(al, ((b0 & 3) << 4) | (b1 >> 4))
+        if i + 1 < n is out = out + string_at(al, ((b1 & 15) << 2) | (b2 >> 6)) end
+        if i + 2 < n is out = out + string_at(al, b2 & 63) end
+        i += 3
+    end
+    return out
+end
+
+pub fn b64_decode_raw(s: string) -> [int] is
+    let al: string = b64_alphabet()
+    let mut out: [int] = []
+    let mut acc: int = 0
+    let mut bits: int = 0
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        let mut v: int = string_find(al, c)
+        if c == "-" is v = 62 end
+        if c == "_" is v = 63 end
+        if c == "=" is return out end
+        if v < 0 is return [] end
+        acc = ((acc << 6) | v) & 16777215
+        bits += 6
+        if bits >= 8 is
+            bits -= 8
+            out = array_push(out, (acc >> bits) & 255)
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn b64url_encode_raw(b: [int]) -> string is
+    let s: string = b64_encode_raw(b)
+    return string_replace(string_replace(s, "+", "-"), "/", "_")
+end
+
+fn b32_alphabet() -> string is
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+end
+
+pub fn b32_encode_raw(b: [int]) -> string is
+    let al: string = b32_alphabet()
+    let mut out: string = ""
+    let mut acc: int = 0
+    let mut bits: int = 0
+    let mut i: int = 0
+    while i < array_len(b) is
+        acc = ((acc << 8) | b[i]) & 65535
+        bits += 8
+        while bits >= 5 is
+            bits -= 5
+            out = out + string_at(al, (acc >> bits) & 31)
+        end
+        i += 1
+    end
+    if bits > 0 is out = out + string_at(al, (acc << (5 - bits)) & 31) end
+    return out
+end
+
+;; -1 entries are not returned: invalid input yields an empty array.
+pub fn b32_decode_raw(s: string) -> [int] is
+    let al: string = b32_alphabet()
+    let mut out: [int] = []
+    let mut acc: int = 0
+    let mut bits: int = 0
+    let mut i: int = 0
+    while i < string_len(s) is
+        let v: int = string_find(al, string_at(s, i))
+        if v < 0 is return [] end
+        acc = ((acc << 5) | v) & 65535
+        bits += 5
+        if bits >= 8 is
+            bits -= 8
+            out = array_push(out, (acc >> bits) & 255)
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── randomness ───────────────────────────────────────────────────────────────
+
+pub fn rand_bytes(n: int) -> [int] is
+    return bytes_of_hex(random_hex(n))
+end
