@@ -1,0 +1,408 @@
+mod util
+mod crypto
+mod http
+mod ctx
+mod audit
+mod sys
+
+fn name_ok(s: string) -> bool is
+    let n: int = string_len(s)
+    if n < 1 || n > 32 is return false end
+    if !string_contains("abcdefghijklmnopqrstuvwxyz_", string_at(s, 0)) is return false end
+    return util::all_in(s, "abcdefghijklmnopqrstuvwxyz0123456789_-")
+end
+
+fn shell_ok(s: string) -> bool is
+    return string_len(s) >= 2 && string_len(s) <= 61 && string_starts_with(s, "/") && util::all_in(s, util::alnum() + "/_.-")
+end
+
+fn getent_lines(db: string) -> [string] is
+    return util::split_clean(shell("getent " + db + " 2>/dev/null"), "\n")
+end
+
+fn locked_of(name: string, map: string) -> string is
+    ;; map is the `passwd -Sa` output; returns "true" / "false" / "null"
+    let ls: [string] = string_split(map, "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = util::split_clean(ls[i], " ")
+        if array_len(f) >= 2 && f[0] == name is
+            if f[1] == "L" is return "true" end
+            return "false"
+        end
+        i += 1
+    end
+    return "null"
+end
+
+pub fn list_users_json() -> string is
+    let lm: string = shell(sys::priv("passwd -Sa") + " 2>/dev/null")
+    let ls: [string] = getent_lines("passwd")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], ":")
+        if array_len(f) >= 7 is
+            let uid: int = util::to_i(f[2])
+            let gecos: string = string_split(f[4], ",")[0]
+            out = array_push(out, util::jo([util::ks("username", f[0]), util::kv("uid", util::ji(uid)), util::kv("gid", util::ji(util::to_i(f[3]))),
+                util::ks("gecos", gecos), util::ks("home", f[5]), util::ks("shell", f[6]),
+                util::kv("locked", if lm == "" then "null" else locked_of(f[0], lm)), util::kv("system", util::jb(uid < 1000 && uid != 0))]))
+        end
+        i += 1
+    end
+    return util::ja(out)
+end
+
+pub fn list_groups_json() -> string is
+    let ls: [string] = getent_lines("group")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], ":")
+        if array_len(f) >= 4 is
+            let members: [string] = if f[3] == "" then [] else string_split(f[3], ",")
+            out = array_push(out, util::jo([util::ks("groupname", f[0]), util::kv("gid", util::ji(util::to_i(f[2]))), util::kv("members", util::jstrs(members))]))
+        end
+        i += 1
+    end
+    return util::ja(out)
+end
+
+fn shells_json() -> string is
+    let mut out: [string] = []
+    if file_exists("/etc/shells") is
+        let ls: [string] = string_split(file_read("/etc/shells"), "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let l: string = string_trim(ls[i])
+            if shell_ok(l) is out = array_push(out, l) end
+            i += 1
+        end
+    else is
+        out = ["/bin/bash", "/usr/sbin/nologin"]
+    end
+    return util::jstrs(out)
+end
+
+;; "" when allowed, otherwise the refusal text.
+fn protected(name: string) -> string is
+    if !name_ok(name) is return "invalid user name" end
+    let l: string = string_trim(shell("getent passwd " + util::sq(name) + " 2>/dev/null"))
+    if l == "" is return "user: unknown user " + name end
+    let uid: string = string_split(l, ":")[2]
+    if uid == "0" is return "refusing to modify root" end
+    if string_trim(shell("id -un")) == name is return "refusing to modify the account the panel runs as" end
+    return ""
+end
+
+fn run(cmd: string) -> string is
+    let r: [string] = sys::run_rc(sys::priv(cmd))
+    if r[1] == "0" is return "" end
+    return "exit status " + r[1] + ": " + string_trim(r[0])
+end
+
+fn set_password(name: string, pw: string) -> string is
+    let p: string = protected(name)
+    if p != "" is return p end
+    if string_len(pw) < 8 || string_len(pw) > 200 || string_contains(pw, "\n") || string_contains(pw, "\r") is
+        return "password must be 8–200 characters without line breaks"
+    end
+    let tmp: string = "/tmp/.hckpt-pw." + random_hex(6)
+    util::write_private(tmp, name + ":" + pw + "\n")
+    let e: string = run("sh -c " + util::sq("chpasswd < " + tmp))
+    shell("rm -f " + util::sq(tmp))
+    return e
+end
+
+fn create(name: string, gecos: string, shell_: string, password: string, groups: [string]) -> string is
+    if !name_ok(name) is return "invalid user name (lowercase letters, digits, _ -)" end
+    if string_len(gecos) > 60 || string_contains(gecos, ":") || string_contains(gecos, ",") || string_contains(gecos, "\n") is return "invalid full name" end
+    let sh: string = if shell_ == "" then "/bin/bash" else shell_
+    if !shell_ok(sh) is return "invalid shell" end
+    let mut cmd: string = "useradd -m -s " + util::sq(sh) + " -c " + util::sq(gecos)
+    let mut i: int = 0
+    while i < array_len(groups) is
+        if !name_ok(groups[i]) is return "invalid group name" end
+        i += 1
+    end
+    if array_len(groups) > 0 is cmd = cmd + " -G " + util::sq(util::join(groups, ",")) end
+    let e: string = run(cmd + " -- " + util::sq(name))
+    if e != "" is return e end
+    if password != "" is return set_password(name, password) end
+    return ""
+end
+
+fn delete(name: string, remove_home: bool) -> string is
+    let p: string = protected(name)
+    if p != "" is return p end
+    let uid: int = util::to_i(string_split(string_trim(shell("getent passwd " + util::sq(name))), ":")[2])
+    if uid < 1000 is return "refusing to delete a system account" end
+    return run("userdel " + (if remove_home then "-r " else "") + "-- " + util::sq(name))
+end
+
+pub fn sysusers(fd: int, c: [string]) is
+    http::respond_json(fd, 200, util::jo([util::kv("users", list_users_json()), util::kv("groups", list_groups_json()), util::kv("shells", shells_json())]))
+end
+
+pub fn sysuser_create(fd: int, c: [string]) is
+    let b: string = ctx::body(c)
+    let e: string = create(util::jstr(b, "name"), util::jstr(b, "full_name"), util::jstr(b, "shell"), util::jstr(b, "password"), util::jstr_list(b, "groups"))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "sysuser.create", util::jstr(b, "name"))
+    http::ok(fd, "user " + util::jstr(b, "name") + " created")
+end
+
+pub fn sysuser_delete(fd: int, c: [string], name: string) is
+    let e: string = delete(name, ctx::q(c, "remove_home") == "1")
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "sysuser.delete", name)
+    http::ok(fd, "user " + name + " deleted")
+end
+
+pub fn sysuser_action(fd: int, c: [string], name: string) is
+    let action: string = ctx::bstr(c, "action")
+    let value: string = ctx::bstr(c, "value")
+    let mut e: string = ""
+    if action == "lock" || action == "unlock" is
+        e = protected(name)
+        if e == "" is e = run("usermod " + (if action == "lock" then "-L" else "-U") + " -- " + util::sq(name)) end
+    else if action == "shell" is
+        e = protected(name)
+        if e == "" && !shell_ok(value) is e = "invalid shell" end
+        if e == "" is e = run("usermod -s " + util::sq(value) + " -- " + util::sq(name)) end
+    else if action == "password" is
+        e = set_password(name, value)
+    else if action == "addgroup" || action == "delgroup" is
+        e = protected(name)
+        if e == "" && !name_ok(value) is e = "invalid group name" end
+        if e == "" is e = run("gpasswd " + (if action == "addgroup" then "-a" else "-d") + " " + util::sq(name) + " " + util::sq(value)) end
+    else is
+        e = "unknown action"
+    end
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "sysuser." + action, if action == "password" then name else name + " " + value)
+    http::ok(fd, "done")
+end
+
+pub fn group_create(fd: int, c: [string]) is
+    let n: string = ctx::bstr(c, "name")
+    if !name_ok(n) is
+        http::err(fd, 400, "invalid group name")
+        return
+    end
+    let e: string = run("groupadd -- " + util::sq(n))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "sysgroup.create", n)
+    http::ok(fd, "group created")
+end
+
+pub fn group_delete(fd: int, c: [string], n: string) is
+    if !name_ok(n) is
+        http::err(fd, 400, "invalid group name")
+        return
+    end
+    let gl: string = string_trim(shell("getent group " + util::sq(n)))
+    if gl != "" && util::to_i(string_split(gl, ":")[2]) < 1000 is
+        http::err(fd, 400, "refusing to delete a system group")
+        return
+    end
+    let e: string = run("groupdel -- " + util::sq(n))
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    audit::log(ctx::user(c), "sysgroup.delete", n)
+    http::ok(fd, "group deleted")
+end
+
+;; ── SSH keys ─────────────────────────────────────────────────────────────────
+
+fn key_types() -> [string] is
+    return ["ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+            "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-dss"]
+end
+
+;; Parses one authorized_keys line → JSON object of the key or "" when invalid.
+;; The raw line is kept in the "line" field (stripped before sending to the UI).
+fn parse_key(line0: string) -> string is
+    let line: string = string_trim(line0)
+    if line == "" || string_starts_with(line, "#") || string_contains(line, "\n") || string_contains(line, "\r") is return "" end
+    let f: [string] = util::split_clean(line, " ")
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < array_len(f) && idx < 0 is
+        if util::has(key_types(), f[i]) is idx = i end
+        i += 1
+    end
+    if idx < 0 || idx + 1 >= array_len(f) is return "" end
+    let raw: [int] = crypto::b64_decode_raw(f[idx + 1])
+    if array_len(raw) < 16 is return "" end
+    let mut opts: string = ""
+    let mut k: int = 0
+    while k < idx is
+        opts = opts + (if k > 0 then " " else "") + f[k]
+        k += 1
+    end
+    let mut comment: string = ""
+    let mut m: int = idx + 2
+    while m < array_len(f) is
+        comment = comment + (if m > idx + 2 then " " else "") + f[m]
+        m += 1
+    end
+    return util::jo([util::ks("type", f[idx]), util::ks("fingerprint", "SHA256:" + crypto::b64_encode_raw(crypto::sha256(raw))),
+        util::ks("comment", comment), util::ks("options", opts), util::ks("line", line)])
+end
+
+fn home_of(name: string) -> [string] is
+    if !name_ok(name) is return [] end
+    let l: string = string_trim(shell("getent passwd " + util::sq(name) + " 2>/dev/null"))
+    if l == "" is return [] end
+    let f: [string] = string_split(l, ":")
+    return [f[5], f[2], f[3]]
+end
+
+fn read_authorized(home: string) -> [string] is
+    let out: string = shell(sys::priv("cat -- " + util::sq(home + "/.ssh/authorized_keys")) + " 2>/dev/null")
+    if string_trim(out) == "" is return [] end
+    return string_split(string_trim(out), "\n")
+end
+
+fn write_authorized(h: [string], lines: [string]) -> string is
+    let tmp: string = "/tmp/.hckpt-keys." + random_hex(6)
+    let body: string = if array_len(lines) == 0 then "" else util::join(lines, "\n") + "\n"
+    file_write(tmp, body)
+    shell("chmod 644 " + util::sq(tmp))
+    let a: string = run("install -d -m 700 -o " + h[1] + " -g " + h[2] + " -- " + util::sq(h[0] + "/.ssh"))
+    let b: string = if a == "" then run("install -m 600 -o " + h[1] + " -g " + h[2] + " -- " + util::sq(tmp) + " " + util::sq(h[0] + "/.ssh/authorized_keys")) else a
+    shell("rm -f " + util::sq(tmp))
+    return b
+end
+
+pub fn keys_list(fd: int, c: [string], name: string) is
+    let h: [string] = home_of(name)
+    if array_len(h) == 0 is
+        http::err(fd, 400, "invalid user name")
+        return
+    end
+    let lines: [string] = read_authorized(h[0])
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let k: string = parse_key(lines[i])
+        if k != "" is
+            let mut pairs: [string] = [util::ks("type", util::jstr(k, "type")), util::ks("fingerprint", util::jstr(k, "fingerprint")), util::ks("comment", util::jstr(k, "comment"))]
+            if util::jstr(k, "options") != "" is pairs = array_push(pairs, util::ks("options", util::jstr(k, "options"))) end
+            out = array_push(out, util::jo(pairs))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("keys", util::ja(out))]))
+end
+
+pub fn keys_add(fd: int, c: [string], name: string) is
+    let k: string = parse_key(ctx::bstr(c, "key"))
+    if k == "" is
+        http::err(fd, 400, "unsupported or malformed public key")
+        return
+    end
+    if util::jstr(k, "options") != "" is
+        http::err(fd, 400, "keys with options are not accepted through the panel")
+        return
+    end
+    if string_len(util::jstr(k, "comment")) > 80 || !util::all_in(util::jstr(k, "comment"), util::alnum() + "_@.- +") is
+        http::err(fd, 400, "key comment contains unsupported characters")
+        return
+    end
+    let h: [string] = home_of(name)
+    if array_len(h) == 0 is
+        http::err(fd, 400, "invalid user name")
+        return
+    end
+    let lines: [string] = read_authorized(h[0])
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let e: string = parse_key(lines[i])
+        if e != "" && util::jstr(e, "fingerprint") == util::jstr(k, "fingerprint") is
+            http::err(fd, 400, "this key is already authorised")
+            return
+        end
+        i += 1
+    end
+    let err: string = write_authorized(h, array_push(lines, util::jstr(k, "line")))
+    if err != "" is
+        http::err(fd, 400, err)
+        return
+    end
+    audit::log(ctx::user(c), "sshkey.add", name + " " + util::jstr(k, "fingerprint"))
+    http::ok(fd, "key added")
+end
+
+pub fn keys_revoke(fd: int, c: [string], name: string) is
+    let fp: string = ctx::q(c, "fingerprint")
+    let h: [string] = home_of(name)
+    if array_len(h) == 0 is
+        http::err(fd, 400, "invalid user name")
+        return
+    end
+    let lines: [string] = read_authorized(h[0])
+    let mut kept: [string] = []
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let e: string = parse_key(lines[i])
+        if e != "" && util::jstr(e, "fingerprint") == fp is found = true else is kept = array_push(kept, lines[i]) end
+        i += 1
+    end
+    if !found is
+        http::err(fd, 400, "no such key")
+        return
+    end
+    let err: string = write_authorized(h, kept)
+    if err != "" is
+        http::err(fd, 400, err)
+        return
+    end
+    audit::log(ctx::user(c), "sshkey.revoke", name + " " + fp)
+    http::ok(fd, "key revoked")
+end
+
+pub fn keygen(fd: int, c: [string]) is
+    let mut comment: string = ctx::bstr(c, "comment")
+    if comment == "" is comment = "hackercockpit" end
+    if string_len(comment) > 80 || !util::all_in(comment, util::alnum() + "_@.- +") is
+        http::err(fd, 400, "invalid comment")
+        return
+    end
+    if !util::have("ssh-keygen") is
+        http::err(fd, 400, "ssh-keygen is not installed")
+        return
+    end
+    let dir: string = string_trim(shell("mktemp -d /tmp/hckpt-keygen-XXXXXX"))
+    let r: [string] = sys::run_rc("ssh-keygen -q -t ed25519 -N '' -C " + util::sq(comment) + " -f " + util::sq(dir + "/id"))
+    if r[1] != "0" is
+        shell("rm -rf " + util::sq(dir))
+        http::err(fd, 400, "ssh-keygen: exit status " + r[1] + " " + r[0])
+        return
+    end
+    let privkey: string = file_read(dir + "/id")
+    let pubkey: string = string_trim(file_read(dir + "/id.pub"))
+    shell("rm -rf " + util::sq(dir))
+    let k: string = parse_key(pubkey)
+    audit::log(ctx::user(c), "sshkey.generate", util::jstr(k, "fingerprint"))
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"),
+        util::kv("pair", util::jo([util::ks("private", privkey), util::ks("public", pubkey), util::ks("fingerprint", util::jstr(k, "fingerprint"))])),
+        util::ks("message", "The private key is shown once and is not stored on the server.")]))
+end
