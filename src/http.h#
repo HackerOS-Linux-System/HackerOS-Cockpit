@@ -1,0 +1,179 @@
+mod net
+mod util
+;; HackerOS-Cockpit — http.h#
+;; HTTP/1.1 request parsing and response writing (Connection: close).
+
+;; Reads a full request (headers + Content-Length body, capped at 8 MiB).
+;; Returns "" when the peer sent nothing usable.
+pub fn read_request(fd: int) -> string is
+    let mut raw: string = ""
+    let mut guard: int = 0
+    while string_find(raw, "\r\n\r\n") < 0 && guard < 512 is
+        let chunk: string = net::fd_read(fd, 8192)
+        if chunk == "" is return "" end
+        raw = raw + chunk
+        if string_len(raw) > 65536 && string_find(raw, "\r\n\r\n") < 0 is return "" end
+        guard += 1
+    end
+    let cut: int = string_find(raw, "\r\n\r\n")
+    let head: string = string_slice(raw, 0, cut)
+    let want: int = content_length(head)
+    if want > 8388608 is return "" end
+    let mut body_len: int = string_len(raw) - (cut + 4)
+    while body_len < want is
+        let chunk: string = net::fd_read(fd, 65536)
+        if chunk == "" is return raw end
+        raw = raw + chunk
+        body_len = string_len(raw) - (cut + 4)
+    end
+    return raw
+end
+
+pub fn head_of(raw: string) -> string is
+    let cut: int = string_find(raw, "\r\n\r\n")
+    if cut < 0 is return raw end
+    return string_slice(raw, 0, cut)
+end
+
+pub fn body_of(raw: string) -> string is
+    let cut: int = string_find(raw, "\r\n\r\n")
+    if cut < 0 is return "" end
+    return string_slice(raw, cut + 4, string_len(raw))
+end
+
+fn request_line(head: string) -> string is
+    let nl: int = string_find(head, "\r\n")
+    if nl < 0 is return head end
+    return string_slice(head, 0, nl)
+end
+
+pub fn method_of(head: string) -> string is
+    let rl: string = request_line(head)
+    let sp: int = string_find(rl, " ")
+    if sp < 0 is return "" end
+    return string_slice(rl, 0, sp)
+end
+
+pub fn target_of(head: string) -> string is
+    let rl: string = request_line(head)
+    let a: int = string_find(rl, " ")
+    if a < 0 is return "/" end
+    let rest: string = string_slice(rl, a + 1, string_len(rl))
+    let b: int = string_find(rest, " ")
+    if b < 0 is return rest end
+    return string_slice(rest, 0, b)
+end
+
+pub fn path_of(target: string) -> string is
+    let q: int = string_find(target, "?")
+    if q < 0 is return target end
+    return string_slice(target, 0, q)
+end
+
+pub fn query_of(target: string) -> string is
+    let q: int = string_find(target, "?")
+    if q < 0 is return "" end
+    return string_slice(target, q + 1, string_len(target))
+end
+
+;; Case-insensitive header lookup ("" when absent).
+pub fn header(head: string, name: string) -> string is
+    let want: string = string_lower(name)
+    let ls: [string] = string_split(head, "\r\n")
+    let mut i: int = 1
+    while i < array_len(ls) is
+        let c: int = string_find(ls[i], ":")
+        if c > 0 && string_lower(string_slice(ls[i], 0, c)) == want is
+            return string_trim(string_slice(ls[i], c + 1, string_len(ls[i])))
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn content_length(head: string) -> int is
+    let v: string = header(head, "Content-Length")
+    if v == "" || !util::is_digits(v) is return 0 end
+    return util::to_i(v)
+end
+
+;; ── responses ────────────────────────────────────────────────────────────────
+
+pub fn status_text(code: int) -> string is
+    if code == 200 is return "OK" end
+    if code == 204 is return "No Content" end
+    if code == 302 is return "Found" end
+    if code == 400 is return "Bad Request" end
+    if code == 401 is return "Unauthorized" end
+    if code == 403 is return "Forbidden" end
+    if code == 404 is return "Not Found" end
+    if code == 405 is return "Method Not Allowed" end
+    if code == 409 is return "Conflict" end
+    if code == 429 is return "Too Many Requests" end
+    if code == 502 is return "Bad Gateway" end
+    if code == 500 is return "Internal Server Error" end
+    if code == 501 is return "Not Implemented" end
+    if code == 503 is return "Service Unavailable" end
+    return "Status"
+end
+
+;; Security headers sent with every response (same policy as the Go server).
+fn common_headers() -> string is
+    return "X-Content-Type-Options: nosniff\r\n" +
+           "X-Frame-Options: DENY\r\n" +
+           "Referrer-Policy: same-origin\r\n" +
+           "Cross-Origin-Opener-Policy: same-origin\r\n" +
+           "Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-s/wN7S4eYR1KnzwUFs6GPcb8DdhLYD1QhjU1CyK6lWM='; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'\r\n" +
+           "Cache-Control: no-store\r\n" +
+           "Connection: close\r\n"
+end
+
+pub fn head_block(code: int, ctype: string, extra: string, length: int) -> string is
+    return "HTTP/1.1 " + to_string(code) + " " + status_text(code) + "\r\n" +
+           "Content-Type: " + ctype + "\r\n" +
+           "Content-Length: " + to_string(length) + "\r\n" +
+           common_headers() + extra + "\r\n"
+end
+
+;; NOTE: Content-Length counts bytes; `body` is written byte-per-char by
+;; net::fd_write, so callers must pass ASCII/Latin-1-safe text (JSON is —
+;; non-ASCII is emitted as \uXXXX by util::jq callers, see json_ascii()).
+pub fn respond(fd: int, code: int, ctype: string, extra: string, body: string) is
+    net::fd_write(fd, head_block(code, ctype, extra, string_len(body)) + body)
+end
+
+pub fn respond_json(fd: int, code: int, body: string) is
+    respond(fd, code, "application/json; charset=utf-8", "", body + "\n")
+end
+
+pub fn respond_json_h(fd: int, code: int, extra: string, body: string) is
+    respond(fd, code, "application/json; charset=utf-8", extra, body + "\n")
+end
+
+pub fn err(fd: int, code: int, msg: string) is
+    respond_json(fd, code, util::jo([util::ks("status", "error"), util::ks("message", msg)]))
+end
+
+pub fn err_code(fd: int, code: int, kind: string, msg: string) is
+    respond_json(fd, code, util::jo([util::ks("status", "error"), util::ks("code", kind), util::ks("message", msg)]))
+end
+
+pub fn ok(fd: int, msg: string) is
+    respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("message", msg)]))
+end
+
+pub fn respond_asset(fd: int, ctype: string, hex: string) is
+    net::fd_write(fd, head_block(200, ctype, "Cache-Control: public, max-age=3600\r\n", string_len(hex) / 2))
+    net::fd_write_hex(fd, hex)
+end
+
+pub fn ctype_for(path: string) -> string is
+    if string_ends_with(path, ".css") is return "text/css; charset=utf-8" end
+    if string_ends_with(path, ".js") is return "text/javascript; charset=utf-8" end
+    if string_ends_with(path, ".html") is return "text/html; charset=utf-8" end
+    if string_ends_with(path, ".svg") is return "image/svg+xml" end
+    if string_ends_with(path, ".woff2") is return "font/woff2" end
+    if string_ends_with(path, ".txt") is return "text/plain; charset=utf-8" end
+    if string_ends_with(path, ".png") is return "image/png" end
+    return "application/octet-stream"
+end
