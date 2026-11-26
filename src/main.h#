@@ -1,0 +1,81 @@
+mod util
+mod net
+mod config
+mod auth
+mod server
+mod m_backup
+mod m_metrics
+
+fn usage() is
+    write("usage:")
+    write("  hackercockpit                 start the panel")
+    write("  hackercockpit backup run <id> run a backup profile headless (for cron)")
+    write("  hackercockpit version         print the version")
+end
+
+fn main() is
+    let args: [string] = env::args()
+    if array_len(args) >= 2 is
+        let sub: string = args[1]
+        if sub == "version" || sub == "--version" is
+            write(config::name() + " " + config::version() + " (" + config::codename() + ", " + config::build_target() + ")")
+            exit(0)
+        end
+        if sub == "backup" && array_len(args) >= 4 && args[2] == "run" is
+            let id: string = args[3]
+            let e: string = m_backup::execute(-1, id, "run", "cron")
+            if e != "" is
+                write("backup failed: " + e)
+                exit(1)
+            end
+            write("backup finished")
+            exit(0)
+        end
+        usage()
+        exit(2)
+    end
+
+    let host: string = config::host()
+    let port: int = config::port()
+
+    if !config::auth_enabled() && !config::is_loopback(host) && !config::allow_insecure() is
+        write("refusing to listen on " + host + " without authentication.")
+        write("Set HCKPT_AUTH=1, bind to 127.0.0.1, or set HCKPT_ALLOW_INSECURE=1 to override.")
+        exit(1)
+    end
+    if config::tls_cert() != "" || env_get("HCKPT_TLS_KEY") != "" is
+        write("note: this H# build has no built-in TLS — terminate TLS in nginx/caddy (see deploy/) and set HCKPT_TRUST_PROXY=1 HCKPT_COOKIE_SECURE=1.")
+    end
+
+    shell("mkdir -p " + util::sq(config::data_dir()) + " && chmod 700 " + util::sq(config::data_dir()))
+
+    if config::auth_enabled() is
+        let first: string = auth::ensure_store()
+        if first != "" is
+            write("")
+            write("  First start — an administrator account was created:")
+            write("      username: admin")
+            write("      password: " + first)
+            write("  This password is shown only once. Change it after signing in.")
+            write("")
+        end
+    end
+
+    write(config::name() + " " + config::version() + " (" + config::codename() + ", " + config::build_target() + ")")
+    write("listening on http://" + host + ":" + to_string(port) + (if config::auth_enabled() then "  [auth on]" else "  [auth off]"))
+
+    net::flush_out()
+
+    ;; background collector: metrics history, threshold alerts, service/cert watchers
+    let parent: int = net::pid()
+    let kid: int = net::proc_fork()
+    if kid == 0 is
+        m_metrics::run(parent)
+        net::proc_exit(0)
+    end
+
+    let rc: int = server::serve(host, port)
+    net::flush_out()
+    write("could not listen on " + host + ":" + to_string(port))
+    exit(rc)
+end
