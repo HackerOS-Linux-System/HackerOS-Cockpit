@@ -1,0 +1,93 @@
+mod util
+;; HackerOS-Cockpit — config.h#
+;; Runtime configuration from HCKPT_* environment variables (same names and
+;; defaults as the Go version).
+
+pub fn version() -> string is return "0.5.1" end
+pub fn codename() -> string is return "Graphite" end
+pub fn name() -> string is return "HackerOS-Cockpit" end
+pub fn build_target() -> string is return "H# / HackerOS-Debian x86_64" end
+
+fn env_str(key: string, def: string) -> string is
+    let v: string = env_get(key)
+    if v == "" is return def end
+    return v
+end
+
+fn env_int(key: string, def: int) -> int is
+    let v: string = env_get(key)
+    if v == "" || !util::is_digits(v) is return def end
+    return util::to_i(v)
+end
+
+fn env_bool(key: string, def: bool) -> bool is
+    let v: string = string_lower(env_get(key))
+    if v == "1" || v == "true" || v == "yes" || v == "on" is return true end
+    if v == "0" || v == "false" || v == "no" || v == "off" is return false end
+    return def
+end
+
+pub fn host() -> string is return env_str("HCKPT_HOST", "127.0.0.1") end
+pub fn port() -> int is return env_int("HCKPT_PORT", 4545) end
+
+pub fn data_dir() -> string is
+    let home: string = env_str("HOME", ".")
+    return env_str("HCKPT_DATA_DIR", home + "/.local/share/hackercockpit")
+end
+
+pub fn logo_path() -> string is
+    return env_str("HCKPT_LOGO_PATH", "/usr/share/HackerOS/ICONS/HackerOS.png")
+end
+
+pub fn auth_enabled() -> bool is return env_bool("HCKPT_AUTH", false) end
+pub fn allow_insecure() -> bool is return env_bool("HCKPT_ALLOW_INSECURE", false) end
+pub fn trust_proxy() -> bool is return env_bool("HCKPT_TRUST_PROXY", false) end
+pub fn cookie_secure() -> bool is return env_bool("HCKPT_COOKIE_SECURE", false) end
+pub fn session_ttl() -> int is return env_int("HCKPT_SESSION_HOURS", 12) * 3600 end
+pub fn idle_ttl() -> int is return env_int("HCKPT_IDLE_MINUTES", 60) * 60 end
+pub fn terminal_timeout() -> int is return env_int("HCKPT_TERMINAL_TIMEOUT", 30) end
+pub fn pentest_timeout() -> int is return env_int("HCKPT_PENTEST_TIMEOUT", 300) end
+pub fn command_max_len() -> int is return env_int("HCKPT_COMMAND_MAX_LEN", 2000) end
+
+pub fn f_search() -> bool is return env_bool("HCKPT_FEATURE_SEARCH", true) end
+pub fn f_news() -> bool is return env_bool("HCKPT_FEATURE_NEWS", true) end
+pub fn f_docker() -> bool is return env_bool("HCKPT_FEATURE_DOCKER", true) end
+pub fn f_firewall() -> bool is return env_bool("HCKPT_FEATURE_FIREWALL", true) end
+pub fn f_cron() -> bool is return env_bool("HCKPT_FEATURE_CRON", true) end
+pub fn f_pty() -> bool is return env_bool("HCKPT_FEATURE_PTY", true) end
+pub fn f_pentest() -> bool is return env_bool("HCKPT_FEATURE_PENTEST", true) end
+pub fn f_terminal() -> bool is return env_bool("HCKPT_FEATURE_TERMINAL", true) end
+pub fn f_backup() -> bool is return env_bool("HCKPT_FEATURE_BACKUP", true) end
+
+pub fn webhook_url() -> string is return env_str("HCKPT_WEBHOOK_URL", "") end
+
+fn list_of(key: string, def: string) -> [string] is
+    return util::split_clean(env_str(key, def), ",")
+end
+
+pub fn default_services() -> [string] is
+    return list_of("HCKPT_SERVICES", "ssh,apache2,nginx,docker,mysql,postgresql,redis,fail2ban,cron,ufw")
+end
+pub fn default_logs() -> [string] is
+    return list_of("HCKPT_LOG_FILES", "/var/log/syslog,/var/log/auth.log,/var/log/kern.log,/var/log/dpkg.log")
+end
+pub fn default_roots() -> [string] is
+    return list_of("HCKPT_FILE_ROOTS", "/")
+end
+
+pub fn is_loopback(h: string) -> bool is
+    return h == "127.0.0.1" || h == "localhost" || h == "::1"
+end
+
+pub fn search_provider() -> string is return string_lower(env_str("HCKPT_SEARCH_PROVIDER", "ddg")) end
+pub fn search_api_key() -> string is return env_str("HCKPT_SEARCH_API_KEY", "") end
+pub fn searx_url() -> string is return env_str("HCKPT_SEARX_URL", "") end
+pub fn metrics_interval() -> int is
+    let n: int = env_int("HCKPT_METRICS_INTERVAL", 30)
+    if n < 5 is return 30 end
+    return n
+end
+pub fn cert_dirs() -> [string] is
+    return list_of("HCKPT_CERT_DIRS", "/etc/letsencrypt/live,/etc/ssl/hackercockpit," + data_dir() + "/certs")
+end
+pub fn tls_cert() -> string is return env_str("HCKPT_TLS_CERT", "") end
