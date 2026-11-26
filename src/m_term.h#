@@ -1,0 +1,406 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod audit
+mod ws
+mod sys
+
+extern static [c] is
+    fn forkpty(master: int, name: int, termp: int, winp: int) -> int
+    fn ioctl(fd: int, req: int, arg: int) -> int
+    fn system(cmd: string) -> int
+    fn kill(pid: int, sig: int) -> int
+end
+
+;; ── safety guard ─────────────────────────────────────────────────────────────
+
+fn has_word(s: string, w: string) -> bool is
+    let mut from: int = 0
+    while from <= string_len(s) - string_len(w) is
+        let rest: string = string_slice(s, from, string_len(s))
+        let p: int = string_find(rest, w)
+        if p < 0 is return false end
+        let a: int = from + p
+        let before: string = if a == 0 then " " else string_at(s, a - 1)
+        let after: string = if a + string_len(w) >= string_len(s) then " " else string_at(s, a + string_len(w))
+        if !string_contains(util::alnum() + "_", before) && !string_contains(util::alnum() + "_", after) is return true end
+        from = a + 1
+    end
+    return false
+end
+
+fn squeeze(s: string) -> string is
+    return util::join(util::split_clean(string_replace(string_replace(s, "\t", " "), "\n", " "), " "), " ")
+end
+
+fn rm_rf(cmd: string) -> bool is
+    let segs: [string] = string_split(string_replace(string_replace(string_replace(string_replace(string_replace(string_replace(string_replace(cmd, "&", ";"), "|", ";"), "\n", ";"), "(", ";"), ")", ";"), "{{", ";"), "}}", ";"), ";")
+    let mut i: int = 0
+    while i < array_len(segs) is
+        let f: [string] = util::split_clean(string_replace(segs[i], "\t", " "), " ")
+        let mut k: int = 0
+        while k < array_len(f) is
+            if util::basename(f[k]) == "rm" is
+                let mut rec: bool = false
+                let mut force: bool = false
+                let mut j: int = k + 1
+                let mut stop: bool = false
+                while j < array_len(f) && !stop is
+                    let a: string = f[j]
+                    if a == "--" is stop = true
+                    else if a == "--recursive" is rec = true
+                    else if a == "--force" is force = true
+                    else if a == "--no-preserve-root" is return true
+                    else if string_starts_with(a, "-") && !string_starts_with(a, "--") is
+                        if string_contains(a, "r") || string_contains(a, "R") is rec = true end
+                        if string_contains(a, "f") is force = true end
+                    end
+                    j += 1
+                end
+                if rec && force is return true end
+            end
+            k += 1
+        end
+        i += 1
+    end
+    return false
+end
+
+;; "" when the command is fine, otherwise the reason it is blocked.
+pub fn reason(cmd: string) -> string is
+    let sq: string = squeeze(cmd)
+    let low: string = string_lower(sq)
+    if string_contains(string_replace(sq, " ", ""), ":(){{:|:&}};:") || string_contains(string_replace(sq, " ", ""), ":(){{:|:}};:") is return "fork bomb" end
+    if has_word(low, "mkfs") || string_contains(low, "mkfs.") || has_word(low, "wipefs") || has_word(low, "shred") || has_word(low, "blkdiscard") is return "disk-destroying utility" end
+    if has_word(low, "dd") && (string_contains(low, "if=/dev/") || string_contains(low, "of=/dev/")) is return "raw device access with dd" end
+    let tgts: [string] = ["/dev/sd", "/dev/nvme", "/dev/vd", "/dev/hd", "/dev/mmcblk"]
+    let mut i: int = 0
+    while i < array_len(tgts) is
+        if string_contains(string_replace(low, "> ", ">"), ">" + tgts[i]) is return "redirect onto a block device" end
+        i += 1
+    end
+    if (string_contains(low, "base64") || string_contains(low, "xxd") || string_contains(low, "openssl enc")) is
+        let pipes: [string] = string_split(low, "|")
+        let mut k: int = 1
+        while k < array_len(pipes) is
+            let w: [string] = util::split_clean(pipes[k], " ")
+            let mut idx: int = 0
+            if array_len(w) > 0 && w[0] == "sudo" is idx = 1 end
+            if array_len(w) > idx && util::has(["sh", "bash", "dash", "zsh"], util::basename(w[idx])) is return "decoding straight into a shell" end
+            k += 1
+        end
+    end
+    if (has_word(low, "chmod") || has_word(low, "chown")) && string_contains(low, " -") && (string_contains(low, " -r ") || string_contains(low, " -rf ") || string_contains(low, " -R ") || string_contains(low, " -fr ") || string_contains(low, " -rv ")) is
+        let w: [string] = util::split_clean(low, " ")
+        if array_len(w) > 0 && w[array_len(w) - 1] == "/" is return "recursive chmod/chown on /" end
+    end
+    if rm_rf(cmd) is return "recursive forced delete (rm -rf)" end
+    return ""
+end
+
+;; ── command terminal ─────────────────────────────────────────────────────────
+
+fn tdir() -> string is return config::data_dir() + "/term" end
+fn safe_actor(a: string) -> string is
+    return string_replace(string_replace(string_replace(a, "/", "_"), ":", "_"), " ", "_")
+end
+fn cwd_file(a: string) -> string is return tdir() + "/" + safe_actor(a) + ".cwd" end
+fn hist_file(a: string) -> string is return tdir() + "/" + safe_actor(a) + ".hist" end
+
+fn get_cwd(a: string) -> string is
+    if file_exists(cwd_file(a)) is
+        let p: string = string_trim(file_read(cwd_file(a)))
+        if p != "" is return p end
+    end
+    let h: string = env_get("HOME")
+    return if h == "" then "/" else h
+end
+
+fn add_history(a: string, cmd: string) is
+    shell("mkdir -p " + util::sq(tdir()) + " && chmod 700 " + util::sq(tdir()))
+    let mut ls: [string] = if file_exists(hist_file(a)) then util::split_clean(file_read(hist_file(a)), "\n") else []
+    if array_len(ls) > 0 && ls[array_len(ls) - 1] == cmd is return end
+    ls = array_push(ls, cmd)
+    while array_len(ls) > 200 is ls = util::remove_at(ls, 0) end
+    util::write_private(hist_file(a), util::join(ls, "\n"))
+end
+
+;; Returns the validated command or "" after having answered with an error.
+fn check_command(fd: int, c: [string]) -> string is
+    let cmd: string = string_trim(ctx::bstr(c, "command"))
+    if cmd == "" is
+        http::err(fd, 400, "no command")
+        return ""
+    end
+    if string_len(cmd) > config::command_max_len() is
+        http::err(fd, 400, "command too long")
+        return ""
+    end
+    let r: string = reason(cmd)
+    if r != "" is
+        audit::log(ctx::user(c), "terminal.blocked", cmd)
+        http::err_code(fd, 403, "guard", "Blocked by the safety net: " + r + ". Use the interactive terminal if you really mean it.")
+        return ""
+    end
+    return cmd
+end
+
+fn wrapper_cmd(actor: string, cmd: string) -> string is
+    shell("mkdir -p " + util::sq(tdir()) + " && chmod 700 " + util::sq(tdir()))
+    let script: string = "cd -- \"$HC_CWD\" 2>/dev/null || cd ~ 2>/dev/null || cd /\neval \"$HC_CMD\"\n__hc_rc=$?\nprintf '%s' \"$PWD\" > \"$HC_CWDFILE\"\nexit $__hc_rc"
+    return "timeout " + to_string(config::terminal_timeout()) + " env HC_CWD=" + util::sq(get_cwd(actor)) + " HC_CMD=" + util::sq(cmd) +
+        " HC_CWDFILE=" + util::sq(cwd_file(actor)) + " TERM=dumb bash -c " + util::sq(script)
+end
+
+pub fn terminal_exec(fd: int, c: [string]) is
+    let cmd: string = check_command(fd, c)
+    if cmd == "" is return end
+    add_history(ctx::user(c), cmd)
+    audit::log(ctx::user(c), "terminal.exec", cmd)
+    let r: [string] = sys::run_rc(wrapper_cmd(ctx::user(c), cmd))
+    let mut pairs: [string] = [util::ks("status", "success"), util::ks("output", r[0]), util::ks("cwd", get_cwd(ctx::user(c)))]
+    if r[1] != "0" is pairs = array_push(pairs, util::ks("exit_error", "exit status " + r[1])) end
+    http::respond_json(fd, 200, util::jo(pairs))
+end
+
+pub fn terminal_stream(fd: int, c: [string]) is
+    let cmd: string = check_command(fd, c)
+    if cmd == "" is return end
+    add_history(ctx::user(c), cmd)
+    audit::log(ctx::user(c), "terminal.exec", cmd)
+    sys::stream_cmd(fd, wrapper_cmd(ctx::user(c), cmd))
+end
+
+pub fn terminal_history(fd: int, c: [string]) is
+    let ls: [string] = if file_exists(hist_file(ctx::user(c))) then util::split_clean(file_read(hist_file(ctx::user(c))), "\n") else []
+    http::respond_json(fd, 200, util::jo([util::kv("history", util::jstrs(ls)), util::ks("cwd", get_cwd(ctx::user(c)))]))
+end
+
+;; ── PTY over WebSocket ───────────────────────────────────────────────────────
+
+fn sess_name(who: string, name: string) -> string is
+    let w: string = string_replace(string_replace(who, ".", "_"), ":", "_")
+    let mut n: string = if string_len(name) > 40 then string_slice(name, 0, 40) else name
+    let mut clean: string = ""
+    let mut i: int = 0
+    while i < string_len(n) is
+        let ch: string = string_at(n, i)
+        if string_contains(util::alnum() + "-_", ch) is clean = clean + ch end
+        i += 1
+    end
+    if clean == "" is return "hckpt_" + w end
+    return "hckpt_" + w + "_" + clean
+end
+
+pub fn pty_supported() -> bool is
+    return file_exists("/dev/ptmx")
+end
+
+fn shell_cmd(session: string, cols: int, rows: int) -> string is
+    let env: string = "TERM=xterm-256color HCKPT_PTY=1"
+    if util::have("tmux") is
+        return "cd \"$HOME\" 2>/dev/null; exec env " + env + " tmux new-session -A -s " + util::sq(session) + " -x " + to_string(cols) + " -y " + to_string(rows)
+    end
+    let sh: string = if env_get("SHELL") != "" then env_get("SHELL") else "/bin/bash"
+    return "cd \"$HOME\" 2>/dev/null; exec env " + env + " " + util::sq(sh) + " -i"
+end
+
+@pointers
+fn set_winsize(master: int, cols: int, rows: int) is
+    let w: int = net::alloc(8)
+    ptr_write_i16(w, 0, rows)
+    ptr_write_i16(w, 2, cols)
+    ptr_write_i16(w, 4, 0)
+    ptr_write_i16(w, 6, 0)
+    ioctl(master, 21524, w)
+    net::release(w)
+end
+
+fn clamp(v: int, lo: int, hi: int, def: int) -> int is
+    if v >= lo && v <= hi is return v end
+    return def
+end
+
+;; GET /api/terminal/ws — runs for the lifetime of the connection.
+@pointers
+pub fn terminal_ws(fd: int, c: [string]) is
+    if !pty_supported() is
+        http::err(fd, 501, "pseudo-terminals are not available on this host")
+        return
+    end
+    if !ws::same_origin(c) is
+        http::err(fd, 403, "cross-site WebSocket blocked")
+        return
+    end
+    if !ws::is_upgrade(c) is
+        http::err(fd, 400, "WebSocket upgrade required")
+        return
+    end
+    let cols: int = clamp(util::to_i(ctx::q(c, "cols")), 20, 500, 100)
+    let rows: int = clamp(util::to_i(ctx::q(c, "rows")), 5, 200, 30)
+    let name: string = sess_name(ctx::user(c), ctx::q(c, "session"))
+    if !ws::handshake(fd, c) is return end
+    audit::log(ctx::user(c), "pty.attach", "session=" + name)
+
+    let mp: int = net::alloc(8)
+    let wsz: int = net::alloc(8)
+    ptr_write_i16(wsz, 0, rows)
+    ptr_write_i16(wsz, 2, cols)
+    ptr_write_i16(wsz, 4, 0)
+    ptr_write_i16(wsz, 6, 0)
+    let pid: int = forkpty(mp, 0, 0, wsz)
+    if pid == 0 is
+        system(shell_cmd(name, cols, rows))
+        net::proc_exit(0)
+    end
+    net::release(wsz)
+    if pid < 0 is
+        ws::send_close(fd, 1011)
+        net::release(mp)
+        return
+    end
+    let master: int = ptr_read_i32(mp, 0)
+    net::release(mp)
+
+    let obuf: int = net::alloc(4200)
+    let ibuf: int = net::alloc(70000)
+    let pf: int = net::alloc(16)
+    let mut ilen: int = 0
+    let mut alive: bool = true
+    let mut idle: int = 0
+    while alive is
+        ptr_write_i32(pf, 0, fd)
+        ptr_write_i16(pf, 4, 1)
+        ptr_write_i16(pf, 6, 0)
+        ptr_write_i32(pf, 8, master)
+        ptr_write_i16(pf, 12, 1)
+        ptr_write_i16(pf, 14, 0)
+        let ready: int = sys::poll_fds(pf, 2, 30000)
+        if ready == 0 is
+            idle += 30
+            if idle >= 2700 is alive = false end
+        else if ready > 0 is
+            let rev_c: int = ptr_read_i16(pf, 6) & 65535
+            let rev_m: int = ptr_read_i16(pf, 14) & 65535
+            if (rev_m & 25) != 0 is
+                ;; POLLIN(1) | POLLERR(8) | POLLHUP(16): shell output or exit
+                let n: int = sys::rd(master, ptr_add(obuf, 4), 4096)
+                if n <= 0 is
+                    alive = false
+                else is
+                    idle = 0
+                    if !ws::send_frame_inplace(fd, obuf, 4, n, 2) is alive = false end
+                end
+            end
+            if alive && (rev_c & 25) != 0 is
+                let got: int = sys::rd(fd, ptr_add(ibuf, ilen), 65536 - ilen + 4000)
+                if got <= 0 is
+                    alive = false
+                else is
+                    idle = 0
+                    ilen += got
+                    let mut more: bool = true
+                    while more && alive is
+                        let fr: [int] = ws::parse_frame(ibuf, ilen)
+                        if fr[0] == 0 is
+                            more = false
+                        else if fr[0] < 0 is
+                            alive = false
+                        else is
+                            let op: int = fr[1]
+                            if op == 2 is
+                                if fr[3] > 0 is
+                                    let mut off: int = 0
+                                    while off < fr[3] is
+                                        let w: int = sys::wr(master, ptr_add(ibuf, fr[2] + off), fr[3] - off)
+                                        if w <= 0 is
+                                            alive = false
+                                            off = fr[3]
+                                        else is
+                                            off += w
+                                        end
+                                    end
+                                end
+                            else if op == 1 is
+                                let t: string = ws::payload_text(ibuf, fr[2], fr[3])
+                                if util::jstr(t, "type") == "resize" is
+                                    let nc: int = util::jint(t, "cols")
+                                    let nr: int = util::jint(t, "rows")
+                                    if nc >= 20 && nc <= 500 && nr >= 5 && nr <= 200 is set_winsize(master, nc, nr) end
+                                end
+                            else if op == 8 is
+                                alive = false
+                            else if op == 9 is
+                                ws::send_frame_inplace(fd, obuf, 4, 0, 10)
+                            end
+                            ws::shift_buffer(ibuf, fr[0], ilen)
+                            ilen -= fr[0]
+                        end
+                    end
+                end
+            end
+        else is
+            alive = false
+        end
+    end
+    ws::send_close(fd, 1000)
+    net::fd_close(master)
+    kill(pid, 1)
+    net::release(obuf)
+    net::release(ibuf)
+    net::release(pf)
+    audit::log(ctx::user(c), "pty.detach", "session=" + name)
+end
+
+;; ── session list / close (tmux) ──────────────────────────────────────────────
+
+pub fn sessions(fd: int, c: [string]) is
+    let mut rows: [string] = []
+    if util::have("tmux") is
+        let out: string = shell("tmux list-sessions -F '#{{session_name}}|#{{session_created}}|#{{session_attached}}|#{{session_width}}|#{{session_height}}' 2>/dev/null")
+        let ls: [string] = string_split(out, "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let f: [string] = string_split(ls[i], "|")
+            if array_len(f) >= 5 && string_starts_with(f[0], "hckpt_") is
+                let started: string = string_trim(shell("date -u -d @" + to_string(util::to_i(f[1])) + " +%Y-%m-%dT%H:%M:%SZ 2>/dev/null"))
+                rows = array_push(rows, util::jo([util::ks("name", f[0]), util::ks("started", started), util::kv("viewers", util::ji(util::to_i(f[2]))),
+                    util::kv("cols", util::ji(util::to_i(f[3]))), util::kv("rows", util::ji(util::to_i(f[4])))]))
+            end
+            i += 1
+        end
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("sessions", util::ja(rows))]))
+end
+
+pub fn session_close(fd: int, c: [string], name: string) is
+    if !string_starts_with(name, "hckpt_") || !util::all_in(name, util::alnum() + "-_") || !util::have("tmux") is
+        http::err(fd, 404, "no such session")
+        return
+    end
+    let r: [string] = sys::run_rc("tmux kill-session -t " + util::sq(name))
+    if r[1] != "0" is
+        http::err(fd, 404, "no such session")
+        return
+    end
+    audit::log(ctx::user(c), "pty.kill", name)
+    http::ok(fd, "session closed")
+end
+
+;; Reaps detached sessions idle for 30 minutes (called by the collector).
+pub fn reap_sessions() is
+    if !util::have("tmux") is return end
+    let out: string = shell("tmux list-sessions -F '#{{session_name}}|#{{session_attached}}|#{{session_activity}}' 2>/dev/null")
+    let ls: [string] = string_split(out, "\n")
+    let now: int = now_unix()
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], "|")
+        if array_len(f) >= 3 && string_starts_with(f[0], "hckpt_") && f[1] == "0" && now - util::to_i(f[2]) > 1800 is
+            shell("tmux kill-session -t " + util::sq(f[0]) + " 2>/dev/null")
+        end
+        i += 1
+    end
+end
