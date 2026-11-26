@@ -1,0 +1,38 @@
+mod util
+mod config
+
+fn path() -> string is return config::data_dir() + "/audit.log" end
+
+fn one_line(s: string) -> string is
+    return string_replace(string_replace(string_replace(s, "\n", " "), "\r", " "), "\t", " ")
+end
+
+fn rotate() is
+    let p: string = util::sq(path())
+    shell("rm -f " + p + ".8.gz; i=7; while [ $i -ge 1 ]; do [ -f " + p + ".$i.gz ] && mv " + p + ".$i.gz " + p + ".$((i+1)).gz; i=$((i-1)); done; gzip -c " + p + " > " + p + ".1.gz && : > " + p)
+end
+
+pub fn log(actor: string, action: string, detail: string) is
+    let who: string = if actor == "" then "anonymous" else actor
+    if file_exists(path()) && fs_size(path()) >= 5242880 is rotate() end
+    let line: string = util::now_iso() + " [" + one_line(who) + "] " + one_line(action) + ": " + one_line(detail) + "\n"
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    fs_append(path(), line)
+    shell("chmod 600 " + util::sq(path()))
+end
+
+;; Last `n` lines (optionally containing `filter`, case-insensitive), oldest first.
+pub fn tail(n: int, filter: string) -> [string] is
+    if !file_exists(path()) is return [] end
+    let cmd: string = if filter == "" then "tail -n " + to_string(n) + " " + util::sq(path())
+        else "grep -i -F -- " + util::sq(filter) + " " + util::sq(path()) + " | tail -n " + to_string(n)
+    let out: string = shell(cmd)
+    let mut res: [string] = []
+    let ls: [string] = string_split(out, "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if ls[i] != "" is res = array_push(res, ls[i]) end
+        i += 1
+    end
+    return res
+end
