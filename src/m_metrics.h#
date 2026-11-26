@@ -1,0 +1,183 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod settings
+mod notify
+mod system
+mod m_certs
+mod m_misc
+mod m_term
+
+fn log_path() -> string is return config::data_dir() + "/metrics.log" end
+fn iface_path(n: string) -> string is return config::data_dir() + "/iface-" + n + ".log" end
+
+fn valid_iface(n: string) -> bool is
+    return string_len(n) >= 1 && string_len(n) <= 32 && util::all_in(n, util::alnum() + "._-@")
+end
+
+fn load_tenths() -> int is
+    let parts: [string] = string_split(system::load1_raw(), ".")
+    return util::to_i(parts[0]) * 10 + (if array_len(parts) > 1 then util::to_i(string_slice(parts[1] + "0", 0, 1)) else 0)
+end
+
+fn trim_log(p: string, max_lines: int) is
+    shell("tail -n " + to_string(max_lines) + " " + util::sq(p) + " > " + util::sq(p + ".tmp") + " && mv " + util::sq(p + ".tmp") + " " + util::sq(p))
+end
+
+;; One sample: appends to the log files, feeds the threshold watcher.
+pub fn tick(n: int) is
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    let now: int = now_unix()
+    let cpu: int = system::cpu_tenths()
+    let m: [int] = system::mem()
+    let d: [int] = system::disk_of("/")
+    let mem_t: int = if m[0] > 0 then m[1] * 1000 / m[0] else 0
+    let disk_t: int = if d[0] > 0 then d[1] * 1000 / d[0] else 0
+    let nt: [int] = system::net_totals()
+    let last_p: string = config::data_dir() + "/.metrics-last"
+    let mut rx_rate: int = 0
+    let mut tx_rate: int = 0
+    if file_exists(last_p) is
+        let l: [string] = util::split_clean(file_read(last_p), " ")
+        if array_len(l) == 3 && now > util::to_i(l[0]) is
+            let dt: int = now - util::to_i(l[0])
+            if nt[0] >= util::to_i(l[1]) is rx_rate = (nt[0] - util::to_i(l[1])) / dt end
+            if nt[1] >= util::to_i(l[2]) is tx_rate = (nt[1] - util::to_i(l[2])) / dt end
+        end
+    end
+    util::write_private(last_p, to_string(now) + " " + to_string(nt[0]) + " " + to_string(nt[1]))
+    fs_append(log_path(), to_string(now) + " " + to_string(cpu) + " " + to_string(mem_t) + " " + to_string(disk_t) + " " + to_string(load_tenths()) + " " + to_string(rx_rate) + " " + to_string(tx_rate) + "\n")
+    ;; per-interface counters
+    let names: [string] = util::split_clean(shell("ls /sys/class/net 2>/dev/null"), "\n")
+    let dev: [string] = string_split(file_read("/proc/net/dev"), "\n")
+    let mut i: int = 0
+    while i < array_len(names) is
+        let nm: string = names[i]
+        let mut j: int = 0
+        while j < array_len(dev) is
+            let ci: int = string_find(dev[j], ":")
+            if ci > 0 && string_trim(string_slice(dev[j], 0, ci)) == nm is
+                let f: [string] = util::split_clean(string_slice(dev[j], ci + 1, string_len(dev[j])), " ")
+                if array_len(f) >= 9 is
+                    let prev_p: string = config::data_dir() + "/.iface-last-" + nm
+                    let rx: int = util::to_i(f[0])
+                    let tx: int = util::to_i(f[8])
+                    if file_exists(prev_p) is
+                        let pl: [string] = util::split_clean(file_read(prev_p), " ")
+                        if array_len(pl) == 3 && now > util::to_i(pl[0]) && rx >= util::to_i(pl[1]) && tx >= util::to_i(pl[2]) is
+                            let dt2: int = now - util::to_i(pl[0])
+                            fs_append(iface_path(nm), to_string(now) + " " + to_string((rx - util::to_i(pl[1])) / dt2) + " " + to_string((tx - util::to_i(pl[2])) / dt2) + "\n")
+                        end
+                    end
+                    util::write_private(prev_p, to_string(now) + " " + to_string(rx) + " " + to_string(tx))
+                end
+            end
+            j += 1
+        end
+        i += 1
+    end
+    if n % 200 == 0 is
+        trim_log(log_path(), 7 * 86400 / config::metrics_interval() + 100)
+        let mut k: int = 0
+        while k < array_len(names) is
+            if file_exists(iface_path(names[k])) is trim_log(iface_path(names[k]), 86400 / config::metrics_interval() + 100) end
+            k += 1
+        end
+    end
+    notify::on_sample(disk_t, mem_t)
+end
+
+fn watch_services() is
+    let names: [string] = settings::notify_services()
+    let mut i: int = 0
+    while i < array_len(names) is
+        let st: string = string_trim(shell("systemctl is-active " + util::sq(names[i]) + " 2>/dev/null"))
+        let known: bool = st != "" && st != "unknown"
+        notify::check_service(names[i], st == "active", known)
+        i += 1
+    end
+end
+
+;; Background loop (own process). Exits when the parent server disappears.
+pub fn run(parent: int) is
+    let mut n: int = 0
+    let mut last_svc: int = 0
+    let mut last_cert: int = 0
+    while true is
+        if string_trim(shell("kill -0 " + to_string(parent) + " 2>/dev/null && echo up")) != "up" is return end
+        tick(n)
+        n += 1
+        let now: int = now_unix()
+        if now - last_svc >= 45 is
+            watch_services()
+            last_svc = now
+        end
+        if n % 10 == 0 is m_term::reap_sessions() end
+        if now - last_cert >= 21600 is
+            m_certs::check_expiry()
+            last_cert = now
+        end
+        sleep_ms(config::metrics_interval() * 1000)
+    end
+end
+
+;; ── queries ──────────────────────────────────────────────────────────────────
+
+fn span_of(rng: string) -> int is
+    if rng == "1h" is return 3600 end
+    if rng == "6h" is return 21600 end
+    if rng == "7d" is return 604800 end
+    return 86400
+end
+
+pub fn metrics(fd: int, c: [string]) is
+    let rng: string = ctx::q(c, "range")
+    let span: int = span_of(rng)
+    let from: int = now_unix() - span
+    let bucket: int = if span >= 604800 then 1800 else if span >= 86400 then 240 else if span >= 21600 then 60 else 0
+    let prog: string = "{{b=" + to_string(bucket) + "; if($1<" + to_string(from) + ")next; k=(b>0)?int($1/b):NR; if(k!=cur&&n>0){{emit()}} cur=k; n++; t=$1; for(i=2;i<=7;i++)s[i]+=$i}} " +
+        "function emit(){{printf \"%s{{\\\"t\\\":%d,\\\"cpu\\\":%.1f,\\\"mem\\\":%.1f,\\\"disk\\\":%.1f,\\\"load\\\":%.1f,\\\"rx\\\":%d,\\\"tx\\\":%d}}\", (o++?\",\":\"\"), t, s[2]/n/10, s[3]/n/10, s[4]/n/10, s[5]/n/10, s[6]/n, s[7]/n; for(i=2;i<=7;i++)s[i]=0; n=0}} END{{if(n>0)emit()}}"
+    let pts: string = if file_exists(log_path()) then shell("awk " + util::sq(prog) + " " + util::sq(log_path()) + " 2>/dev/null") else ""
+    http::respond_json(fd, 200, "{{\"range\":" + util::jq(rng) + ",\"interval\":" + to_string(config::metrics_interval()) + ",\"points\":[" + pts + "]}}")
+end
+
+pub fn interfaces(fd: int, c: [string]) is
+    let files: [string] = util::split_clean(shell("ls " + util::sq(config::data_dir()) + " 2>/dev/null | grep '^iface-.*\\.log$'"), "\n")
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(files) is
+        names = array_push(names, string_slice(files[i], 6, string_len(files[i]) - 4))
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("interfaces", util::jstrs(names))]))
+end
+
+pub fn iface(fd: int, c: [string], name: string) is
+    if !valid_iface(name) is
+        http::err(fd, 400, "invalid interface")
+        return
+    end
+    let rng: string = ctx::q(c, "range")
+    let span: int = if rng == "6h" then 21600 else if rng == "24h" then 86400 else 3600
+    let from: int = now_unix() - span
+    let prog: string = "$1>=" + to_string(from) + "{{printf \"%s{{\\\"t\\\":%d,\\\"rx\\\":%d,\\\"tx\\\":%d}}\", (o++?\",\":\"\"), $1, $2, $3}}"
+    let pts: string = if file_exists(iface_path(name)) then shell("awk " + util::sq(prog) + " " + util::sq(iface_path(name)) + " 2>/dev/null") else ""
+    http::respond_json(fd, 200, "{{\"interface\":" + util::jq(name) + ",\"points\":[" + pts + "]}}")
+end
+
+;; Notifications API
+pub fn notifications(fd: int, c: [string]) is
+    http::respond_json(fd, 200, notify::list_json(100))
+end
+
+pub fn notifications_read(fd: int, c: [string]) is
+    notify::mark_read(util::jint(ctx::body(c), "id"))
+    http::ok(fd, "marked as read")
+end
+
+pub fn notifications_clear(fd: int, c: [string]) is
+    notify::clear()
+    http::ok(fd, "notifications cleared")
+end
