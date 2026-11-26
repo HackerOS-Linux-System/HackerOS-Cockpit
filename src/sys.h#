@@ -1,0 +1,165 @@
+mod util
+mod net
+
+extern static [c] is
+    fn popen(cmd: string, mode: string) -> int
+    fn pclose(f: int) -> int
+    fn fileno(f: int) -> int
+    fn read(fd: int, buf: int, n: int) -> int
+    fn poll(fds: int, n: int, timeout: int) -> int
+    fn writev(fd: int, iov: int, n: int) -> int
+end
+
+;; Runs `cmd` through /bin/sh; returns [combined output, exit code].
+pub fn run_rc(cmd: string) -> [string] is
+    let out: string = shell("( " + cmd + " ) 2>&1; echo \"@@rc=$?\"")
+    let at: int = string_rfind(out, "@@rc=")
+    if at < 0 is return [out, "1"] end
+    return [string_slice(out, 0, at), string_trim(string_slice(out, at + 5, string_len(out)))]
+end
+
+pub fn priv(cmd: string) -> string is
+    if util::is_root() is return cmd end
+    return "sudo -n " + cmd
+end
+
+pub fn realpath(p: string) -> string is
+    return string_trim(shell("readlink -f -- " + util::sq(p) + " 2>/dev/null"))
+end
+
+;; ── SSE ──────────────────────────────────────────────────────────────────────
+
+pub fn sse_begin(fd: int) -> bool is
+    return net::fd_write(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n" +
+        "Connection: keep-alive\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\r\n")
+end
+
+pub fn sse_send(fd: int, event: string, data: string) -> bool is
+    let mut msg: string = ""
+    if event != "" is msg = "event: " + event + "\n" end
+    let ls: [string] = string_split(data, "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        msg = msg + "data: " + ls[i] + "\n"
+        i += 1
+    end
+    return net::fd_write(fd, msg + "\n")
+end
+
+pub fn sse_done(fd: int, ok: bool, err: string) is
+    let mut pairs: [string] = [util::kv("ok", util::jb(ok))]
+    if err != "" is pairs = array_push(pairs, util::ks("error", err)) end
+    sse_send(fd, "done", util::jo(pairs))
+end
+
+;; Streams the combined output of `cmd` line by line (event "line"), then a
+;; final "done" event {ok, error?}. Sends a ping every 15 s of silence.
+pub fn stream_cmd(fd: int, cmd: string) is
+    if !sse_begin(fd) is return end
+    stream_run(fd, cmd, true)
+end
+
+;; Same as stream_cmd but the SSE headers were already sent.
+pub fn stream_cmd_nohdr(fd: int, cmd: string) is
+    stream_run(fd, cmd, true)
+end
+
+;; Core loop: streams `cmd` output as "line" events. Returns [exit code, last
+;; lines joined with " ⏎ "]. When `send_done` is false the caller emits "done".
+@pointers
+pub fn stream_run(fd: int, cmd: string, send_done: bool) -> [string] is
+    let f: int = popen("( " + cmd + " ) 2>&1", "r")
+    if f == 0 is
+        if send_done is sse_done(fd, false, "could not start the command") end
+        return ["1", "could not start the command"]
+    end
+    let pfd: int = fileno(f)
+    let buf: int = net::alloc(4097)
+    let pf: int = net::alloc(8)
+    let mut carry: string = ""
+    let mut tail: [string] = []
+    let mut alive: bool = true
+    while alive is
+        ptr_write_i32(pf, 0, pfd)
+        ptr_write_i16(pf, 4, 1)
+        ptr_write_i16(pf, 6, 0)
+        let ready: int = poll(pf, 1, 15000)
+        if ready == 0 is
+            if !sse_send(fd, "ping", "") is alive = false end
+        else is
+            let n: int = read(pfd, buf, 4096)
+            if n <= 0 is
+                alive = false
+            else is
+                ptr_write_i8(buf, n, 0)
+                carry = carry + net::cstr(buf)
+                let parts: [string] = string_split(carry, "\n")
+                let mut i: int = 0
+                while i < array_len(parts) - 1 is
+                    let l: string = string_replace(parts[i], "\r", "")
+                    tail = array_push(tail, l)
+                    if array_len(tail) > 6 is tail = util::remove_at(tail, 0) end
+                    if !sse_send(fd, "line", l) is alive = false end
+                    i += 1
+                end
+                carry = parts[array_len(parts) - 1]
+            end
+        end
+    end
+    if carry != "" is
+        sse_send(fd, "line", carry)
+        tail = array_push(tail, carry)
+    end
+    net::release(buf)
+    net::release(pf)
+    let rc: int = pclose(f) / 256
+    if send_done is
+        if rc == 0 is sse_done(fd, true, "") else is sse_done(fd, false, "exit status " + to_string(rc)) end
+    end
+    return [to_string(rc), util::join(tail, " ⏎ ")]
+end
+
+;; Copies the raw stdout of `cmd` to the socket (binary safe; file downloads).
+@pointers
+pub fn pipe_raw(fd: int, cmd: string) -> bool is
+    let f: int = popen(cmd, "r")
+    if f == 0 is return false end
+    let pfd: int = fileno(f)
+    let buf: int = net::alloc(65536)
+    let mut ok: bool = true
+    let mut go: bool = true
+    while go is
+        let n: int = read(pfd, buf, 65536)
+        if n <= 0 is
+            go = false
+        else is
+            if !net::send_raw(fd, buf, n) is
+                ok = false
+                go = false
+            end
+        end
+    end
+    net::release(buf)
+    pclose(f)
+    return ok
+end
+
+;; Shell suffix that makes arbitrary command/file output safe to embed in JSON.
+pub fn json_safe() -> string is
+    return " | iconv -c -f UTF-8 -t UTF-8 2>/dev/null | tr -d '\\000-\\010\\013\\014\\016-\\037'"
+end
+
+;; Thin wrappers so other modules never declare libc symbols a second time.
+pub fn rd(fd: int, buf: int, n: int) -> int is return read(fd, buf, n) end
+;; write(2)-equivalent for any fd (pty master) through writev — `write` itself is
+;; a reserved word in H#.
+@pointers
+pub fn wr(fd: int, buf: int, n: int) -> int is
+    let iov: int = net::alloc(16)
+    ptr_write_i64(iov, 0, buf)
+    ptr_write_i64(iov, 8, n)
+    let w: int = writev(fd, iov, 1)
+    net::release(iov)
+    return w
+end
+pub fn poll_fds(pf: int, n: int, ms: int) -> int is return poll(pf, n, ms) end
