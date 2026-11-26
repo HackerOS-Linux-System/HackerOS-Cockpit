@@ -1,0 +1,144 @@
+mod util
+mod config
+
+fn path() -> string is return config::data_dir() + "/settings.json" end
+fn hist_path() -> string is return config::data_dir() + "/settings_history.json" end
+
+fn list_or(raw: string, key: string, def: string) -> string is
+    let v: string = util::jget(raw, key)
+    if v == "" || v == "null" is return def end
+    return v
+end
+
+fn int_in(v: int, def: int) -> int is
+    if v <= 0 || v > 100 is return def end
+    return v
+end
+
+pub fn default_email() -> string is
+    return "{{\"enabled\":false,\"host\":\"\",\"port\":587,\"security\":\"starttls\",\"username\":\"\",\"password\":\"\",\"from\":\"\",\"to\":[],\"min_level\":\"warn\"}}"
+end
+
+;; Merges stored values over the environment defaults and normalises them.
+pub fn normalize(raw: string) -> string is
+    let mut roots: string = list_or(raw, "file_roots", util::jstrs(config::default_roots()))
+    if roots == "[]" is roots = "[\"/\"]" end
+    let mut warn_days: int = util::jint(raw, "cert_warn_days")
+    if warn_days <= 0 is warn_days = 14 end
+    let mut webhook: string = util::jstr(raw, "webhook_url")
+    if webhook == "" is webhook = config::webhook_url() end
+    let email: string = list_or(raw, "email", default_email())
+    return util::jo([
+        util::kv("services", list_or(raw, "services", util::jstrs(config::default_services()))),
+        util::kv("allowed_logs", list_or(raw, "allowed_logs", util::jstrs(config::default_logs()))),
+        util::kv("file_roots", roots),
+        util::kv("notify_services", list_or(raw, "notify_services", "[]")),
+        util::ks("webhook_url", webhook),
+        util::kv("email", email),
+        util::kv("disk_warn_pct", util::ji(int_in(util::jint(raw, "disk_warn_pct"), 90))),
+        util::kv("mem_warn_pct", util::ji(int_in(util::jint(raw, "mem_warn_pct"), 90))),
+        util::kv("cert_warn_days", util::ji(warn_days)),
+        util::kv("hosts", list_or(raw, "hosts", "[]"))
+    ])
+end
+
+pub fn load() -> string is
+    if !file_exists(path()) is return normalize("{{}}") end
+    return normalize(file_read(path()))
+end
+
+pub fn services() -> [string] is return util::jstr_list(load(), "services") end
+pub fn allowed_logs() -> [string] is return util::jstr_list(load(), "allowed_logs") end
+pub fn file_roots() -> [string] is return util::jstr_list(load(), "file_roots") end
+pub fn notify_services() -> [string] is return util::jstr_list(load(), "notify_services") end
+pub fn webhook() -> string is return util::jstr(load(), "webhook_url") end
+pub fn disk_warn() -> int is return util::jint(load(), "disk_warn_pct") end
+pub fn mem_warn() -> int is return util::jint(load(), "mem_warn_pct") end
+pub fn cert_warn() -> int is return util::jint(load(), "cert_warn_days") end
+pub fn email() -> string is return util::jget(load(), "email") end
+pub fn hosts() -> string is return util::jget(load(), "hosts") end
+
+;; ── history ──────────────────────────────────────────────────────────────────
+
+fn history_items() -> [string] is
+    if !file_exists(hist_path()) is return [] end
+    return util::jitems(file_read(hist_path()))
+end
+
+fn next_id(items: [string]) -> int is
+    let mut m: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        if util::jint(items[i], "id") > m is m = util::jint(items[i], "id") end
+        i += 1
+    end
+    return m + 1
+end
+
+fn record(actor: string) is
+    let mut items: [string] = history_items()
+    let e: string = util::jo([util::kv("id", util::ji(next_id(items))), util::ks("time", util::now_iso()),
+        util::ks("actor", actor), util::kv("settings", load())])
+    items = array_push(items, e)
+    while array_len(items) > 25 is items = util::remove_at(items, 0) end
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    util::write_private(hist_path(), util::ja(items))
+end
+
+pub fn replace(next_raw: string, actor: string) is
+    record(actor)
+    shell("mkdir -p " + util::sq(config::data_dir()) + " && chmod 700 " + util::sq(config::data_dir()))
+    util::write_private(path(), normalize(next_raw))
+end
+
+;; Newest first (as the Go version returns it).
+pub fn history_json() -> string is
+    let items: [string] = history_items()
+    let mut out: [string] = []
+    let mut i: int = array_len(items) - 1
+    while i >= 0 is
+        out = array_push(out, items[i])
+        i -= 1
+    end
+    return util::ja(out)
+end
+
+;; Restores version `id`; returns the restored settings JSON or "".
+pub fn rollback(id: int, actor: string) -> string is
+    let items: [string] = history_items()
+    let mut i: int = 0
+    while i < array_len(items) is
+        if util::jint(items[i], "id") == id is
+            let target: string = util::jget(items[i], "settings")
+            record(actor)
+            util::write_private(path(), normalize(target))
+            return load()
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── UI view: secrets never leave the server ──────────────────────────────────
+
+pub fn view_of(raw: string) -> string is
+    let em: string = util::jget(raw, "email")
+    let hosts: [string] = util::jitems(util::jget(raw, "hosts"))
+    let mut hv: [string] = []
+    let mut i: int = 0
+    while i < array_len(hosts) is
+        hv = array_push(hv, util::jo([util::ks("name", util::jstr(hosts[i], "name")), util::ks("url", util::jstr(hosts[i], "url")),
+            util::kv("has_token", util::jb(util::jstr(hosts[i], "token") != "")), util::kv("insecure", util::jb(util::jbool(hosts[i], "insecure")))]))
+        i += 1
+    end
+    let ev: string = util::jo([util::kv("enabled", util::jb(util::jbool(em, "enabled"))), util::ks("host", util::jstr(em, "host")),
+        util::kv("port", util::ji(util::jint(em, "port"))), util::ks("security", util::jstr(em, "security")),
+        util::ks("username", util::jstr(em, "username")), util::kv("has_password", util::jb(util::jstr(em, "password") != "")),
+        util::ks("from", util::jstr(em, "from")), util::kv("to", util::jstrs(util::jstr_list(em, "to"))),
+        util::ks("min_level", util::jstr(em, "min_level"))])
+    return util::jo([util::kv("services", util::jget(raw, "services")), util::kv("allowed_logs", util::jget(raw, "allowed_logs")),
+        util::kv("file_roots", util::jget(raw, "file_roots")), util::kv("notify_services", util::jget(raw, "notify_services")),
+        util::ks("webhook_url", util::jstr(raw, "webhook_url")), util::kv("email", ev),
+        util::kv("disk_warn_pct", util::jget(raw, "disk_warn_pct")), util::kv("mem_warn_pct", util::jget(raw, "mem_warn_pct")),
+        util::kv("cert_warn_days", util::jget(raw, "cert_warn_days")), util::kv("hosts", util::ja(hv))])
+end
