@@ -1,0 +1,11 @@
+cockpit.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:4545 {
+        flush_interval -1          # SSE: never buffer
+        transport http {
+            read_timeout  1h
+            write_timeout 1h
+        }
+    }
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
