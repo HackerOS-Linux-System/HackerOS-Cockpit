@@ -1,0 +1,411 @@
+mod util
+mod net
+mod http
+mod ctx
+mod config
+mod audit
+mod notify
+mod m_cron
+mod sys
+
+fn path() -> string is return config::data_dir() + "/backups.json" end
+fn lock_path(id: string) -> string is return config::data_dir() + "/backup-run-" + id + ".lock" end
+
+fn profiles() -> [string] is
+    if !file_exists(path()) is return [] end
+    return util::jitems(util::jget(file_read(path()), "profiles"))
+end
+
+fn history_all() -> [string] is
+    if !file_exists(path()) is return [] end
+    return util::jitems(util::jget(file_read(path()), "history"))
+end
+
+fn save_all(ps: [string], hist: [string]) is
+    shell("mkdir -p " + util::sq(config::data_dir()) + " && chmod 700 " + util::sq(config::data_dir()))
+    util::write_private(path(), util::jo([util::kv("profiles", util::ja(ps)), util::kv("history", util::ja(hist))]))
+end
+
+pub fn find(id: string) -> string is
+    let ps: [string] = profiles()
+    let mut i: int = 0
+    while i < array_len(ps) is
+        if util::jstr(ps[i], "id") == id is return ps[i] end
+        i += 1
+    end
+    return ""
+end
+
+fn running(id: string) -> bool is
+    if !file_exists(lock_path(id)) is return false end
+    let pid: string = string_trim(file_read(lock_path(id)))
+    if !util::is_digits(pid) is return false end
+    return string_trim(shell("kill -0 " + pid + " 2>/dev/null && echo up")) == "up"
+end
+
+fn valid_path(p: string) -> bool is
+    if p == "/" is return true end
+    if p == "" || string_len(p) > 300 || !string_starts_with(p, "/") is return false end
+    if string_contains(p, "\n") || string_contains(p, "\r") || string_ends_with(p, "/") || string_contains(p, "//") || string_contains(p, "/./") || string_contains(p, "/../") is return false end
+    return true
+end
+
+fn name_ok(n: string) -> bool is
+    if string_len(n) < 1 || string_len(n) > 60 is return false end
+    return !string_contains(n, "\n") && !string_contains(n, "'") && !string_contains(n, "\"") && !string_contains(n, "/") && !string_contains(n, "\\") && !string_contains(n, "$") && !string_contains(n, "`") && !string_contains(n, ";")
+end
+
+;; "" or error
+fn validate(p: string) -> string is
+    if !name_ok(util::jstr(p, "name")) is return "name: 1–60 letters, digits, spaces, . _ -" end
+    let tool: string = util::jstr(p, "tool")
+    let src: string = util::jstr(p, "source")
+    let dst: string = util::jstr(p, "dest")
+    if tool == "rsync" || tool == "tar" || tool == "restic" is
+        if !valid_path(src) is return "source must be a clean absolute path" end
+        if !valid_path(dst) is return "destination must be a clean absolute path" end
+        if dst == "/" || src == dst || (src != "/" && string_starts_with(dst, src + "/")) is return "destination must not be the source or inside it" end
+    else if tool != "timeshift" is
+        return "tool must be rsync, tar, restic or timeshift"
+    end
+    if tool == "restic" && !valid_path(util::jstr(p, "password_file")) is return "restic needs an absolute path to a password file" end
+    let ex: [string] = util::jstr_list(p, "excludes")
+    if array_len(ex) > 50 is return "at most 50 exclude patterns" end
+    let mut i: int = 0
+    while i < array_len(ex) is
+        if string_len(ex[i]) < 1 || string_len(ex[i]) > 120 || string_starts_with(ex[i], "-") || !util::all_in(ex[i], util::alnum() + "_./*?@+- []") is
+            return "invalid exclude pattern: " + ex[i]
+        end
+        i += 1
+    end
+    let sch: string = string_trim(util::jstr(p, "schedule"))
+    if sch != "" is
+        let nf: int = array_len(util::split_clean(sch, " "))
+        if nf != 5 && !string_starts_with(sch, "@") is return "schedule must be a 5-field cron expression or @daily etc." end
+    end
+    return ""
+end
+
+fn profile_json(p: string, id: string) -> string is
+    return util::jo([util::ks("id", id), util::ks("name", util::jstr(p, "name")), util::ks("tool", util::jstr(p, "tool")),
+        util::ks("source", util::jstr(p, "source")), util::ks("dest", util::jstr(p, "dest")),
+        util::kv("excludes", util::jstrs(util::jstr_list(p, "excludes"))), util::kv("delete", util::jb(util::jbool(p, "delete"))),
+        util::ks("password_file", util::jstr(p, "password_file")), util::ks("schedule", string_trim(util::jstr(p, "schedule")))])
+end
+
+fn exe_path() -> string is
+    return string_trim(shell("readlink -f /proc/" + to_string(net::pid()) + "/exe 2>/dev/null"))
+end
+
+fn cron_command(id: string) -> string is
+    return "HCKPT_DATA_DIR=" + util::sq(config::data_dir()) + " " + util::sq(exe_path()) + " backup run " + id
+end
+
+fn sync_schedule(id: string, schedule: string) -> string is
+    if schedule == "" is return m_cron::remove_managed("backup-" + id) end
+    return m_cron::set_managed("backup-" + id, schedule, cron_command(id))
+end
+
+fn allowed(c: [string], id: string) -> bool is
+    let sc: [string] = ctx::scope_list(c, "backups")
+    return array_len(sc) == 0 || util::has(sc, id)
+end
+
+pub fn backups(fd: int, c: [string]) is
+    let sc: [string] = ctx::scope_list(c, "backups")
+    let ps: [string] = profiles()
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(ps) is
+        let id: string = util::jstr(ps[i], "id")
+        if array_len(sc) == 0 || util::has(sc, id) is
+            rows = array_push(rows, util::jo([util::ks("id", id), util::ks("name", util::jstr(ps[i], "name")), util::ks("tool", util::jstr(ps[i], "tool")),
+                util::ks("source", util::jstr(ps[i], "source")), util::ks("dest", util::jstr(ps[i], "dest")),
+                util::kv("excludes", util::jstrs(util::jstr_list(ps[i], "excludes"))), util::kv("delete", util::jb(util::jbool(ps[i], "delete"))),
+                util::ks("password_file", util::jstr(ps[i], "password_file")), util::ks("schedule", util::jstr(ps[i], "schedule")),
+                util::kv("running", util::jb(running(id)))]))
+        end
+        i += 1
+    end
+    let h: [string] = history_all()
+    let mut out: [string] = []
+    let mut k: int = array_len(h) - 1
+    while k >= 0 && array_len(out) < 40 is
+        if array_len(sc) == 0 || util::has(sc, util::jstr(h[k], "profile_id")) is out = array_push(out, h[k]) end
+        k -= 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("profiles", util::ja(rows)), util::kv("history", util::ja(out))]))
+end
+
+pub fn backup_save(fd: int, c: [string], id0: string) is
+    let b: string = ctx::body(c)
+    if id0 != "" && !allowed(c, id0) is
+        http::err(fd, 403, "this backup profile is outside your account's scope")
+        return
+    end
+    let e: string = validate(b)
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    let ps: [string] = profiles()
+    let mut id: string = id0
+    let mut out: [string] = []
+    if id == "" is
+        id = crypto_id()
+        out = array_push(ps, profile_json(b, id))
+    else is
+        if !util::all_in(id, "0123456789abcdef") || string_len(id) < 8 || string_len(id) > 16 is
+            http::err(fd, 400, "invalid id")
+            return
+        end
+        let mut found: bool = false
+        let mut i: int = 0
+        while i < array_len(ps) is
+            if util::jstr(ps[i], "id") == id is
+                found = true
+                out = array_push(out, profile_json(b, id))
+            else is
+                out = array_push(out, ps[i])
+            end
+            i += 1
+        end
+        if !found is
+            http::err(fd, 400, "no such profile")
+            return
+        end
+    end
+    save_all(out, history_all())
+    let saved: string = profile_json(b, id)
+    let mut msg: string = "profile saved"
+    let se: string = sync_schedule(id, string_trim(util::jstr(b, "schedule")))
+    if se != "" is msg = msg + " (schedule not installed: " + se + ")" end
+    audit::log(ctx::user(c), "backup.save", util::jstr(b, "name") + " [" + util::jstr(b, "tool") + "]")
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("message", msg), util::kv("profile", saved)]))
+end
+
+fn crypto_id() -> string is
+    return random_hex(5)
+end
+
+pub fn backup_delete(fd: int, c: [string], id: string) is
+    if !allowed(c, id) is
+        http::err(fd, 403, "this backup profile is outside your account's scope")
+        return
+    end
+    sync_schedule(id, "")
+    let ps: [string] = profiles()
+    let mut out: [string] = []
+    let mut hit: bool = false
+    let mut i: int = 0
+    while i < array_len(ps) is
+        if util::jstr(ps[i], "id") == id is hit = true else is out = array_push(out, ps[i]) end
+        i += 1
+    end
+    if !hit is
+        http::err(fd, 404, "no such profile")
+        return
+    end
+    save_all(out, history_all())
+    audit::log(ctx::user(c), "backup.delete", id)
+    http::ok(fd, "profile deleted")
+end
+
+;; Shell command for a profile; "" with error in out[1] when invalid.
+fn build(p: string, action: string) -> [string] is
+    let e: string = validate(p)
+    if e != "" is return ["", e] end
+    let tool: string = util::jstr(p, "tool")
+    let src: string = util::jstr(p, "source")
+    let dst: string = util::jstr(p, "dest")
+    let ex: [string] = util::jstr_list(p, "excludes")
+    if tool == "rsync" is
+        let mut cmd: string = "rsync -aHAX --stats"
+        if util::jbool(p, "delete") is cmd = cmd + " --delete" end
+        let mut i: int = 0
+        while i < array_len(ex) is
+            cmd = cmd + " " + util::sq("--exclude=" + ex[i])
+            i += 1
+        end
+        let s: string = if string_ends_with(src, "/") then src else src + "/"
+        let d: string = if string_ends_with(dst, "/") then dst else dst + "/"
+        return [cmd + " " + util::sq(s) + " " + util::sq(d), "rsync"]
+    end
+    if tool == "tar" is
+        let safe: string = string_replace(string_replace(string_replace(util::jstr(p, "name"), " ", "_"), "/", "_"), ":", "_")
+        let file: string = dst + "/" + safe + "-" + string_trim(shell("date +%Y%m%d-%H%M%S")) + ".tar.gz"
+        let mut cmd: string = "tar -czf " + util::sq(file)
+        let mut i: int = 0
+        while i < array_len(ex) is
+            cmd = cmd + " " + util::sq("--exclude=" + ex[i])
+            i += 1
+        end
+        if src == "/" is
+            cmd = cmd + " -C / ."
+        else is
+            cmd = cmd + " -C " + util::sq(util::dirname(src)) + " " + util::sq(util::basename(src))
+        end
+        return [cmd, "tar"]
+    end
+    if tool == "restic" is
+        let env: string = "RESTIC_PASSWORD_FILE=" + util::sq(util::jstr(p, "password_file"))
+        if action == "init" is return ["env " + env + " restic -r " + util::sq(dst) + " init", "restic"] end
+        let mut cmd: string = "env " + env + " restic -r " + util::sq(dst) + " backup " + util::sq(src)
+        let mut i: int = 0
+        while i < array_len(ex) is
+            cmd = cmd + " --exclude " + util::sq(ex[i])
+            i += 1
+        end
+        return [cmd, "restic"]
+    end
+    return ["timeshift --create --comments HackerCockpit --scripted", "timeshift"]
+end
+
+;; Runs a profile; streams to `fd` when fd >= 0. Returns "" or an error text.
+pub fn execute(fd: int, id: string, action: string, trigger: string) -> string is
+    let p: string = find(id)
+    if p == "" is return "no such profile" end
+    if running(id) is return "this backup is already running" end
+    let b: [string] = build(p, action)
+    if b[0] == "" is return b[1] end
+    if !util::have(b[1]) is return b[1] + " is not installed" end
+    shell("mkdir -p " + util::sq(config::data_dir()))
+    util::write_private(lock_path(id), to_string(net::pid()))
+    let started: string = util::now_iso()
+    let mut rc: string = "1"
+    let mut tail: string = ""
+    if fd >= 0 is
+        let r: [string] = sys::stream_run(fd, sys::priv(b[0]), false)
+        rc = r[0]
+        tail = r[1]
+    else is
+        let r: [string] = sys::run_rc("timeout 43200 " + sys::priv(b[0]))
+        rc = r[1]
+        let lines: [string] = util::split_clean(r[0], "\n")
+        let mut t: [string] = []
+        let mut k: int = if array_len(lines) > 6 then array_len(lines) - 6 else 0
+        while k < array_len(lines) is
+            t = array_push(t, lines[k])
+            k += 1
+        end
+        tail = util::join(t, " ⏎ ")
+    end
+    shell("rm -f " + util::sq(lock_path(id)))
+    let ok: bool = rc == "0"
+    let mut summary: string = tail
+    if !ok is summary = "exit status " + rc + " — " + tail end
+    if string_len(summary) > 400 is summary = string_slice(summary, 0, 400) + "…" end
+    let run: string = util::jo([util::ks("id", random_hex(4)), util::ks("profile_id", id), util::ks("profile_name", util::jstr(p, "name")),
+        util::ks("started", started), util::ks("ended", util::now_iso()), util::kv("ok", util::jb(ok)), util::ks("summary", summary), util::ks("trigger", trigger)])
+    let mut h: [string] = array_push(history_all(), run)
+    while array_len(h) > 200 is h = util::remove_at(h, 0) end
+    save_all(profiles(), h)
+    if ok is return "" end
+    return "exit status " + rc
+end
+
+pub fn backup_run(fd: int, c: [string], id: string) is
+    if !allowed(c, id) is
+        http::err(fd, 403, "this backup profile is outside your account's scope")
+        return
+    end
+    let mut action: string = ctx::bstr(c, "action")
+    if action == "" is action = "run" end
+    if action != "run" && action != "init" is
+        http::err(fd, 400, "action must be run or init")
+        return
+    end
+    if find(id) == "" is
+        http::err(fd, 404, "no such profile")
+        return
+    end
+    audit::log(ctx::user(c), "backup." + action, id)
+    sys::sse_begin(fd)
+    let e: string = execute(fd, id, action, "manual:" + ctx::user(c))
+    if e != "" is notify::emit("warn", "backup", "", "Backup failed", e) end
+    sys::sse_done(fd, e == "", e)
+end
+
+pub fn backup_snapshots(fd: int, c: [string], id: string) is
+    if !allowed(c, id) is
+        http::err(fd, 403, "this backup profile is outside your account's scope")
+        return
+    end
+    let p: string = find(id)
+    if p == "" is
+        http::err(fd, 400, "no such profile")
+        return
+    end
+    let tool: string = util::jstr(p, "tool")
+    let mut snaps: [string] = []
+    if tool == "restic" is
+        let out: string = shell(sys::priv("env RESTIC_PASSWORD_FILE=" + util::sq(util::jstr(p, "password_file")) + " restic -r " + util::sq(util::jstr(p, "dest")) + " snapshots --json") + " 2>/dev/null")
+        if !string_starts_with(string_trim(out), "[") is
+            http::err(fd, 400, "cannot read the restic repository (initialised? password file correct?)")
+            return
+        end
+        let items: [string] = util::jitems(out)
+        let mut i: int = 0
+        while i < array_len(items) is
+            snaps = array_push(snaps, util::jo([util::ks("id", util::jstr(items[i], "short_id")), util::ks("time", util::jstr(items[i], "time")),
+                util::ks("info", util::join(util::jstr_list(items[i], "paths"), ", "))]))
+            i += 1
+        end
+    else if tool == "tar" is
+        let ls: [string] = util::split_clean(shell(sys::priv("ls -1t -- " + util::sq(util::jstr(p, "dest"))) + " 2>/dev/null"), "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            if string_ends_with(ls[i], ".tar.gz") is snaps = array_push(snaps, util::jo([util::ks("id", ls[i]), util::ks("time", ""), util::ks("info", ls[i])])) end
+            i += 1
+        end
+    else if tool == "timeshift" is
+        let ls: [string] = util::split_clean(shell(sys::priv("timeshift --list --scripted") + " 2>/dev/null"), "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let f: [string] = util::split_clean(ls[i], " ")
+            if array_len(f) > 0 is snaps = array_push(snaps, util::jo([util::ks("id", f[0]), util::ks("time", ""), util::ks("info", string_trim(ls[i]))])) end
+            i += 1
+        end
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("snapshots", util::ja(snaps))]))
+end
+
+pub fn export_profiles() -> string is
+    return util::ja(profiles())
+end
+
+;; Imports profiles by name; returns [added, skipped].
+pub fn import_profiles(raw: string) -> [int] is
+    let existing: [string] = profiles()
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(existing) is
+        names = array_push(names, util::jstr(existing[i], "name"))
+        i += 1
+    end
+    let incoming: [string] = util::jitems(raw)
+    let mut all: [string] = []
+    let mut ex: int = 0
+    while ex < array_len(existing) is
+        all = array_push(all, existing[ex])
+        ex += 1
+    end
+    let mut added: int = 0
+    let mut skipped: int = 0
+    let mut k: int = 0
+    while k < array_len(incoming) is
+        let p: string = incoming[k]
+        if util::has(names, util::jstr(p, "name")) || validate(p) != "" is
+            skipped += 1
+        else is
+            let id: string = crypto_id()
+            all = array_push(all, profile_json(p, id))
+            names = array_push(names, util::jstr(p, "name"))
+            sync_schedule(id, string_trim(util::jstr(p, "schedule")))
+            added += 1
+        end
+        k += 1
+    end
+    save_all(all, history_all())
+    return [added, skipped]
+end
