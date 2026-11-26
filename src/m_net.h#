@@ -1,0 +1,201 @@
+mod util
+mod http
+mod ctx
+mod audit
+mod sys
+
+fn parse_ss(out: string) -> [string] is
+    let ls: [string] = string_split(out, "\n")
+    let mut res: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = util::split_clean(string_replace(ls[i], "\t", " "), " ")
+        if array_len(f) >= 6 is
+            let mut proc: string = ""
+            let a: int = string_find(ls[i], "users:((\"")
+            if a >= 0 is
+                let rest: string = string_slice(ls[i], a + 9, string_len(ls[i]))
+                let q: int = string_find(rest, "\"")
+                let p: int = string_find(rest, "pid=")
+                if q > 0 && p > 0 is
+                    let tail: string = string_slice(rest, p + 4, string_len(rest))
+                    let mut e: int = 0
+                    while e < string_len(tail) && string_contains("0123456789", string_at(tail, e)) is e += 1 end
+                    proc = string_slice(rest, 0, q) + " (" + string_slice(tail, 0, e) + ")"
+                end
+            end
+            res = array_push(res, util::jo([util::ks("proto", f[0]), util::ks("state", f[1]), util::ks("local", f[4]), util::ks("remote", f[5]), util::ks("process", proc)]))
+        end
+        i += 1
+    end
+    return res
+end
+
+fn connections() -> [string] is
+    ;; [json array, truncated]
+    let all: [string] = parse_ss(shell(sys::priv("ss -H -tuanp") + " 2>/dev/null"))
+    let mut res: [string] = []
+    let mut trunc: bool = false
+    let mut i: int = 0
+    while i < array_len(all) is
+        let c: string = all[i]
+        let st: string = util::jstr(c, "state")
+        let rm: string = util::jstr(c, "remote")
+        if !(st == "LISTEN" || st == "UNCONN" || rm == "*:*" || rm == "0.0.0.0:*" || rm == "[::]:*") is
+            if array_len(res) >= 300 is
+                trunc = true
+                i = array_len(all)
+            else is
+                res = array_push(res, c)
+            end
+        end
+        i += 1
+    end
+    return [util::ja(res), util::jb(trunc)]
+end
+
+fn hex_to_int(h: string) -> int is
+    let t: string = string_lower(if string_starts_with(h, "0x") then string_slice(h, 2, string_len(h)) else h)
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < string_len(t) is
+        let d: int = string_find("0123456789abcdef", string_at(t, i))
+        if d < 0 is return v end
+        v = v * 16 + d
+        i += 1
+    end
+    return v
+end
+
+fn interfaces() -> string is
+    let names: [string] = util::split_clean(shell("ls /sys/class/net 2>/dev/null"), "\n")
+    let addrs: string = shell("ip -o addr show 2>/dev/null")
+    let dev: [string] = string_split(file_read("/proc/net/dev"), "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(names) is
+        let n: string = names[i]
+        let base: string = "/sys/class/net/" + n + "/"
+        let flags: int = if file_exists(base + "flags") then hex_to_int(string_trim(file_read(base + "flags"))) else 0
+        let mut a: [string] = []
+        let al: [string] = string_split(addrs, "\n")
+        let mut k: int = 0
+        while k < array_len(al) is
+            let f: [string] = util::split_clean(al[k], " ")
+            if array_len(f) >= 4 && string_trim(string_replace(f[1], ":", "")) == n is a = array_push(a, f[3]) end
+            k += 1
+        end
+        let mut rx: int = 0
+        let mut tx: int = 0
+        let mut d: int = 0
+        while d < array_len(dev) is
+            let c: int = string_find(dev[d], ":")
+            if c > 0 && string_trim(string_slice(dev[d], 0, c)) == n is
+                let cf: [string] = util::split_clean(string_slice(dev[d], c + 1, string_len(dev[d])), " ")
+                if array_len(cf) >= 9 is
+                    rx = util::to_i(cf[0])
+                    tx = util::to_i(cf[8])
+                end
+            end
+            d += 1
+        end
+        let up: bool = flags % 2 == 1
+        out = array_push(out, util::jo([util::ks("name", n), util::ks("state", if up then "UP" else "DOWN"),
+            util::ks("mac", if file_exists(base + "address") then string_trim(file_read(base + "address")) else ""),
+            util::kv("mtu", util::ji(if file_exists(base + "mtu") then util::to_i(file_read(base + "mtu")) else 0)),
+            util::kv("addrs", util::jstrs(a)), util::kv("rx_bytes", util::ji(rx)), util::kv("tx_bytes", util::ji(tx))]))
+        i += 1
+    end
+    return util::ja(out)
+end
+
+fn routes() -> string is
+    let ls: [string] = string_split(shell("ip route show 2>/dev/null"), "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = util::split_clean(ls[i], " ")
+        if array_len(f) > 0 is
+            let mut via: string = ""
+            let mut dev: string = ""
+            let mut proto: string = ""
+            let mut metric: string = ""
+            let mut k: int = 1
+            while k + 1 < array_len(f) is
+                if f[k] == "via" is via = f[k + 1] end
+                if f[k] == "dev" is dev = f[k + 1] end
+                if f[k] == "proto" is proto = f[k + 1] end
+                if f[k] == "metric" is metric = f[k + 1] end
+                k += 1
+            end
+            out = array_push(out, util::jo([util::ks("dest", f[0]), util::ks("gateway", via), util::ks("dev", dev), util::ks("proto", proto), util::ks("metric", metric)]))
+        end
+        i += 1
+    end
+    return util::ja(out)
+end
+
+pub fn network(fd: int, c: [string]) is
+    let mut servers: [string] = []
+    let mut search: [string] = []
+    if file_exists("/etc/resolv.conf") is
+        let ls: [string] = string_split(file_read("/etc/resolv.conf"), "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let f: [string] = util::split_clean(ls[i], " ")
+            if array_len(f) >= 2 is
+                if f[0] == "nameserver" is servers = array_push(servers, f[1]) end
+                if f[0] == "search" || f[0] == "domain" is search = array_push(search, f[1]) end
+            end
+            i += 1
+        end
+    end
+    let conns: [string] = connections()
+    http::respond_json(fd, 200, util::jo([util::kv("interfaces", interfaces()), util::kv("connections", conns[0]), util::kv("connections_truncated", conns[1]),
+        util::kv("listening", util::ja(parse_ss(shell(sys::priv("ss -H -tulnp") + " 2>/dev/null")))), util::kv("routes", routes()),
+        util::kv("dns", util::jstrs(servers)), util::kv("search", util::jstrs(search))]))
+end
+
+pub fn valid_host(h: string) -> bool is
+    let n: int = string_len(h)
+    if n < 1 || n > 253 is return false end
+    let first: string = string_at(h, 0)
+    let last: string = string_at(h, n - 1)
+    return string_contains(util::alnum(), first) && string_contains(util::alnum(), last) && util::all_in(h, util::alnum() + ".-:")
+end
+
+pub fn network_tool(fd: int, c: [string]) is
+    let tool: string = ctx::bstr(c, "tool")
+    let host: string = ctx::bstr(c, "host")
+    if !valid_host(host) is
+        http::err(fd, 400, "invalid host")
+        return
+    end
+    let mut cmd: string = ""
+    let mut name: string = ""
+    if tool == "ping" is
+        name = "ping"
+        cmd = "ping -c 4 -W 2 " + util::sq(host)
+    else if tool == "traceroute" is
+        if util::have("traceroute") is
+            name = "traceroute"
+            cmd = "traceroute -m 15 -w 2 " + util::sq(host)
+        else is
+            name = "tracepath"
+            cmd = "tracepath -m 15 " + util::sq(host)
+        end
+    else if tool == "dig" is
+        name = "dig"
+        cmd = "dig +noall +answer +stats " + util::sq(host)
+    else is
+        http::err(fd, 400, "unsupported tool")
+        return
+    end
+    if !util::have(name) is
+        http::err(fd, 400, name + " is not installed")
+        return
+    end
+    let r: [string] = sys::run_rc("timeout 40 " + cmd)
+    audit::log(ctx::user(c), "network." + tool, host)
+    http::respond_json(fd, 200, util::jo([util::ks("status", "success"), util::ks("output", r[0])]))
+end
