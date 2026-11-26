@@ -1,0 +1,394 @@
+pub fn or_default(v: string, fallback: string) -> string is
+    if v != "" is return v end
+    return fallback
+end
+
+pub fn join(items: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(items) is
+        if i > 0 is out = out + sep end
+        out = out + items[i]
+        i += 1
+    end
+    return out
+end
+
+pub fn has(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn remove_at(items: [string], idx: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        if i != idx is out = array_push(out, items[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Splits on `sep`, dropping empty parts and trimming each.
+pub fn split_clean(s: string, sep: string) -> [string] is
+    let parts: [string] = string_split(s, sep)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let t: string = string_trim(parts[i])
+        if t != "" is out = array_push(out, t) end
+        i += 1
+    end
+    return out
+end
+
+pub fn lines(s: string) -> [string] is
+    return string_split(s, "\n")
+end
+
+pub fn is_digits(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        if !string_contains("0123456789", string_at(s, i)) is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn all_in(s: string, allowed: string) -> bool is
+    let mut i: int = 0
+    while i < string_len(s) is
+        if !string_contains(allowed, string_at(s, i)) is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn alnum() -> string is
+    return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+end
+
+pub fn pad2(n: int) -> string is
+    if n < 10 is return "0" + to_string(n) end
+    return to_string(n)
+end
+
+;; ── shell / processes ────────────────────────────────────────────────────────
+
+pub fn sq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+pub fn is_dir(p: string) -> bool is
+    return string_trim(shell("test -d " + sq(p) + " && echo y")) == "y"
+end
+
+pub fn is_root() -> bool is
+    return string_trim(shell("id -u")) == "0"
+end
+
+pub fn have(tool: string) -> bool is
+    return string_trim(shell("command -v " + sq(tool) + " 2>/dev/null")) != ""
+end
+
+;; ── time ─────────────────────────────────────────────────────────────────────
+
+pub fn now_iso() -> string is
+    return string_trim(shell("date -u +%Y-%m-%dT%H:%M:%SZ"))
+end
+
+;; ── paths ────────────────────────────────────────────────────────────────────
+
+pub fn basename(path: string) -> string is
+    let mut p: string = path
+    while string_len(p) > 1 && string_ends_with(p, "/") is
+        p = string_slice(p, 0, string_len(p) - 1)
+    end
+    let cut: int = string_rfind(p, "/")
+    if cut < 0 is return p end
+    return string_slice(p, cut + 1, string_len(p))
+end
+
+pub fn dirname(path: string) -> string is
+    let mut p: string = path
+    while string_len(p) > 1 && string_ends_with(p, "/") is
+        p = string_slice(p, 0, string_len(p) - 1)
+    end
+    let cut: int = string_rfind(p, "/")
+    if cut < 0 is return "." end
+    if cut == 0 is return "/" end
+    return string_slice(p, 0, cut)
+end
+
+;; Atomic write: temp file + rename, mode 0600.
+pub fn write_private(path: string, data: string) is
+    let tmp: string = path + ".tmp"
+    file_write(tmp, data)
+    shell("chmod 600 " + sq(tmp))
+    fs_rename(tmp, path)
+end
+
+;; ── JSON writer ──────────────────────────────────────────────────────────────
+
+pub fn jq(s: string) -> string is
+    let a: string = string_replace(s, "\\", "\\\\")
+    let b: string = string_replace(a, "\"", "\\\"")
+    let c: string = string_replace(b, "\n", "\\n")
+    let d: string = string_replace(c, "\r", "\\r")
+    let e: string = string_replace(d, "\t", "\\t")
+    return "\"" + e + "\""
+end
+
+pub fn ji(n: int) -> string is return to_string(n) end
+pub fn jb(b: bool) -> string is
+    if b is return "true" end
+    return "false"
+end
+
+;; Float with 1 decimal from tenths (e.g. 123 -> 12.3).
+pub fn jtenths(t: int) -> string is
+    let neg: bool = t < 0
+    let a: int = if neg then 0 - t else t
+    let s: string = to_string(a / 10) + "." + to_string(a % 10)
+    if neg is return "-" + s end
+    return s
+end
+
+pub fn kv(key: string, raw: string) -> string is
+    return jq(key) + ":" + raw
+end
+pub fn ks(key: string, val: string) -> string is
+    return jq(key) + ":" + jq(val)
+end
+
+pub fn jo(pairs: [string]) -> string is
+    return "{{" + join(pairs, ",") + "}}"
+end
+
+pub fn ja(items: [string]) -> string is
+    return "[" + join(items, ",") + "]"
+end
+
+pub fn jstrs(items: [string]) -> string is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, jq(items[i]))
+        i += 1
+    end
+    return ja(out)
+end
+
+;; ── JSON reader (on raw text) ────────────────────────────────────────────────
+
+fn strip_outer(s: string, open: string, close: string) -> string is
+    let t: string = string_trim(s)
+    if string_len(t) >= 2 && string_starts_with(t, open) && string_ends_with(t, close) is
+        return string_trim(string_slice(t, 1, string_len(t) - 1))
+    end
+    return t
+end
+
+;; Splits on commas at nesting depth 0 (aware of strings and brackets).
+fn split_top(text: string) -> [string] is
+    let n: int = string_len(text)
+    let mut parts: [string] = []
+    let mut depth: int = 0
+    let mut in_str: bool = false
+    let mut start: int = 0
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(text, i)
+        if in_str is
+            if c == "\\" is
+                i += 1
+            else if c == "\"" is
+                in_str = false
+            end
+        else is
+            if c == "\"" is
+                in_str = true
+            else if c == "{{" || c == "[" is
+                depth += 1
+            else if c == "}}" || c == "]" is
+                depth -= 1
+            else if c == "," && depth == 0 is
+                parts = array_push(parts, string_trim(string_slice(text, start, i)))
+                start = i + 1
+            end
+        end
+        i += 1
+    end
+    let last: string = string_trim(string_slice(text, start, n))
+    if last != "" is parts = array_push(parts, last) end
+    return parts
+end
+
+;; Raw text of every element of a JSON array.
+pub fn jitems(raw: string) -> [string] is
+    let inner: string = strip_outer(raw, "[", "]")
+    if inner == "" is return [] end
+    return split_top(inner)
+end
+
+fn hex4(s: string) -> int is
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < 4 is
+        let d: int = string_find("0123456789abcdef", string_lower(string_at(s, i)))
+        if d < 0 is return -1 end
+        v = v * 16 + d
+        i += 1
+    end
+    return v
+end
+
+pub fn junq(s: string) -> string is
+    let t: string = string_trim(s)
+    if string_len(t) < 2 || !string_starts_with(t, "\"") || !string_ends_with(t, "\"") is return t end
+    let inner: string = string_slice(t, 1, string_len(t) - 1)
+    let n: int = string_len(inner)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(inner, i)
+        if c == "\\" && i + 1 < n is
+            let e: string = string_at(inner, i + 1)
+            i += 1
+            if e == "n" is out = out + "\n"
+            else if e == "t" is out = out + "\t"
+            else if e == "r" is out = out + "\r"
+            else if e == "b" is out = out + "\b"
+            else if e == "f" is out = out + "\f"
+            else if e == "u" && i + 4 < n is
+                let cp: int = hex4(string_slice(inner, i + 1, i + 5))
+                if cp >= 0 is out = out + char_code_to_str(cp) end
+                i += 4
+            else is out = out + e end
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Raw value of a top-level key ("" when absent).
+pub fn jget(obj: string, key: string) -> string is
+    let inner: string = strip_outer(obj, "{{", "}}")
+    if inner == "" is return "" end
+    let items: [string] = split_top(inner)
+    let mut i: int = 0
+    while i < array_len(items) is
+        let p: string = items[i]
+        let n: int = string_len(p)
+        let mut colon: int = -1
+        let mut in_str: bool = false
+        let mut j: int = 0
+        while j < n && colon < 0 is
+            let c: string = string_at(p, j)
+            if in_str is
+                if c == "\\" is j += 1
+                else if c == "\"" is in_str = false end
+            else is
+                if c == "\"" is in_str = true
+                else if c == ":" is colon = j end
+            end
+            j += 1
+        end
+        if colon > 0 is
+            if junq(string_slice(p, 0, colon)) == key is
+                return string_trim(string_slice(p, colon + 1, n))
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+pub fn jhas(obj: string, key: string) -> bool is
+    return jget(obj, key) != ""
+end
+
+pub fn jstr(obj: string, key: string) -> string is
+    return junq(jget(obj, key))
+end
+
+;; Decimal string -> int (optional leading '-'); non-digits stop the scan.
+pub fn to_i(s: string) -> int is
+    let t: string = string_trim(s)
+    let n: int = string_len(t)
+    let mut i: int = 0
+    let mut neg: bool = false
+    if n > 0 && string_at(t, 0) == "-" is
+        neg = true
+        i = 1
+    end
+    let mut v: int = 0
+    while i < n is
+        let d: int = string_find("0123456789", string_at(t, i))
+        if d < 0 is
+            i = n
+        else is
+            v = v * 10 + d
+            i += 1
+        end
+    end
+    if neg is return 0 - v end
+    return v
+end
+
+pub fn jint(obj: string, key: string) -> int is
+    return to_i(jget(obj, key))
+end
+
+pub fn jbool(obj: string, key: string) -> bool is
+    return jget(obj, key) == "true"
+end
+
+pub fn jstr_list(obj: string, key: string) -> [string] is
+    let items: [string] = jitems(jget(obj, key))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, junq(items[i]))
+        i += 1
+    end
+    return out
+end
+
+;; ── query strings / cookies / headers ────────────────────────────────────────
+
+pub fn query_get(query: string, key: string) -> string is
+    let parts: [string] = string_split(query, "&")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let eq: int = string_find(parts[i], "=")
+        if eq >= 0 is
+            if url_decode(string_slice(parts[i], 0, eq)) == key is
+                return url_decode(string_replace(string_slice(parts[i], eq + 1, string_len(parts[i])), "+", " "))
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+pub fn cookie_get(header: string, name: string) -> string is
+    let parts: [string] = string_split(header, ";")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let t: string = string_trim(parts[i])
+        let eq: int = string_find(t, "=")
+        if eq > 0 && string_slice(t, 0, eq) == name is
+            return string_slice(t, eq + 1, string_len(t))
+        end
+        i += 1
+    end
+    return ""
+end
