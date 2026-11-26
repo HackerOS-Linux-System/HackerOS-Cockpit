@@ -1,1 +1,34 @@
+[package]
+-> name        => hackercockpit
+-> version     => 0.5.1
+-> description => HackerOS Cockpit — web system dashboard for HackerOS/Debian, 100% H#, UI embedded in the binary
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => GPL-3.0
+-> lang        => h#
 
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+! a bare `bit` builds the release binary (the UI is embedded by the pre-build hook)
+[default-build]
+-> profile => release
+
+[commands]
+-> assets
+--> run => sh tools/gen-assets.sh
+--> description => Regenerate src/assets.h# from web/ (embedded frontend)
+-> check
+--> run => sh tests/run.sh check
+--> description => Type-check every module
+-> test
+--> run => sh tests/run.sh
+--> description => Run the unit + end-to-end tests (interpreter, sockets stubbed)
+-> install-local
+--> run => install -Dm755 cache/build/release/hackercockpit /usr/bin/hackercockpit
+--> description => Install the release binary to /usr/bin
+
+[hooks]
+-> pre-build => sh tools/gen-assets.sh
