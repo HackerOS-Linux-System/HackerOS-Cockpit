@@ -1,0 +1,503 @@
+mod util
+mod http
+mod ctx
+mod audit
+mod sys
+
+pub fn detect() -> string is
+    if util::have("ufw") is return "ufw" end
+    if util::have("firewall-cmd") is return "firewalld" end
+    if util::have("nft") is return "nftables" end
+    return "none"
+end
+
+fn rule_json(id: string, action: string, to: string, from: string, dir: string, raw: string) -> string is
+    return util::jo([util::ks("id", id), util::ks("action", action), util::ks("to", to), util::ks("from", from), util::ks("dir", dir), util::ks("raw", raw)])
+end
+
+fn parse_ufw(text: string) -> [string] is
+    let ls: [string] = string_split(text, "\n")
+    let mut rules: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let l: string = string_trim(ls[i])
+        if string_starts_with(l, "[") is
+            let rb: int = string_find(l, "]")
+            if rb > 0 is
+                let id: string = string_trim(string_slice(l, 1, rb))
+                let rest: string = string_trim(string_slice(l, rb + 1, string_len(l)))
+                let gap: int = string_find(rest, "  ")
+                let mut done: bool = false
+                if gap > 0 is
+                    let to: string = string_trim(string_slice(rest, 0, gap))
+                    let tail: [string] = util::split_clean(string_slice(rest, gap, string_len(rest)), " ")
+                    if array_len(tail) >= 2 && util::has(["ALLOW", "DENY", "REJECT", "LIMIT"], tail[0]) is
+                        let mut k: int = 1
+                        let mut dir: string = ""
+                        if util::has(["IN", "OUT", "FWD"], tail[1]) is
+                            dir = tail[1]
+                            k = 2
+                        end
+                        let mut from: string = ""
+                        while k < array_len(tail) is
+                            from = from + (if k > 1 && from != "" then " " else "") + tail[k]
+                            k += 1
+                        end
+                        rules = array_push(rules, rule_json(id, tail[0], to, from, dir, l))
+                        done = true
+                    end
+                end
+                if !done is rules = array_push(rules, rule_json(id, "", "", "", "", l)) end
+            end
+        end
+        i += 1
+    end
+    return rules
+end
+
+fn kv_after(out: string, key: string) -> string is
+    let ls: [string] = string_split(out, "\n")
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let t: string = string_trim(ls[i])
+        let c: int = string_find(t, ":")
+        if c > 0 && string_trim(string_slice(t, 0, c)) == key is return string_trim(string_slice(t, c + 1, string_len(t))) end
+        i += 1
+    end
+    return ""
+end
+
+fn rich_to_rule(line: string) -> string is
+    let mut action: string = "ALLOW"
+    if string_contains(line, " reject") is action = "REJECT" end
+    if string_contains(line, " drop") is action = "DENY" end
+    let mut to: string = "Anywhere"
+    let pi: int = string_find(line, "port=\"")
+    if pi >= 0 is
+        let rest: string = string_slice(line, pi + 6, string_len(line))
+        to = string_slice(rest, 0, string_find(rest, "\""))
+        let pr: int = string_find(line, "protocol=\"")
+        if pr >= 0 is
+            let r2: string = string_slice(line, pr + 10, string_len(line))
+            to = to + "/" + string_slice(r2, 0, string_find(r2, "\""))
+        end
+    end
+    let mut from: string = "Anywhere"
+    let ai: int = string_find(line, "address=\"")
+    if ai >= 0 is
+        let r3: string = string_slice(line, ai + 9, string_len(line))
+        from = string_slice(r3, 0, string_find(r3, "\""))
+    end
+    return rule_json("rich:" + line, action, to, from, "IN", line)
+end
+
+fn parse_firewalld(out: string) -> [string] is
+    let ls: [string] = string_split(out, "\n")
+    let mut rules: [string] = []
+    let mut in_rich: bool = false
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let t: string = string_trim(ls[i])
+        let mut handled: bool = false
+        if in_rich is
+            if string_starts_with(t, "rule ") is
+                rules = array_push(rules, rich_to_rule(t))
+                handled = true
+            else is
+                in_rich = false
+            end
+        end
+        if !handled is
+            let c: int = string_find(t, ":")
+            if c > 0 is
+                let k: string = string_trim(string_slice(t, 0, c))
+                let v: [string] = util::split_clean(string_slice(t, c + 1, string_len(t)), " ")
+                if k == "ports" is
+                    let mut a: int = 0
+                    while a < array_len(v) is
+                        rules = array_push(rules, rule_json("port:" + v[a], "ALLOW", v[a], "Anywhere", "IN", "port " + v[a]))
+                        a += 1
+                    end
+                else if k == "services" is
+                    let mut b: int = 0
+                    while b < array_len(v) is
+                        rules = array_push(rules, rule_json("service:" + v[b], "ALLOW", v[b], "Anywhere", "IN", "service " + v[b]))
+                        b += 1
+                    end
+                else if k == "rich rules" is
+                    in_rich = true
+                end
+            end
+        end
+        i += 1
+    end
+    return rules
+end
+
+fn zones_info() -> [string] is
+    ;; [default zone, zones...]
+    let def: string = string_trim(shell(sys::priv("firewall-cmd --get-default-zone") + " 2>/dev/null"))
+    let all: [string] = util::split_clean(shell(sys::priv("firewall-cmd --get-zones") + " 2>/dev/null"), " ")
+    return array_concat([def], all)
+end
+
+pub fn ssh_ports() -> [string] is
+    let mut ports: [string] = []
+    if file_exists("/etc/ssh/sshd_config") is
+        let ls: [string] = string_split(file_read("/etc/ssh/sshd_config"), "\n")
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let f: [string] = util::split_clean(string_replace(ls[i], "\t", " "), " ")
+            if array_len(f) == 2 && string_lower(f[0]) == "port" && util::is_digits(f[1]) && string_len(f[1]) <= 5 is ports = array_push(ports, f[1]) end
+            i += 1
+        end
+    end
+    if array_len(ports) == 0 is return ["22"] end
+    return ports
+end
+
+fn status_json(zone0: string) -> string is
+    let be: string = detect()
+    let mut pairs: [string] = [util::ks("backend", be), util::kv("available", util::jb(be != "none"))]
+    let mut active: bool = false
+    let mut ro: bool = false
+    let mut rules: [string] = []
+    let mut defaults: string = "{{}}"
+    let mut raw: string = ""
+    let mut msg: string = ""
+    let mut zones: [string] = []
+    let mut azone: string = ""
+    if be == "ufw" is
+        raw = shell(sys::priv("ufw status numbered") + " 2>&1")
+        if string_trim(raw) == "" is
+            msg = "unable to query ufw (needs root or passwordless sudo)"
+        else is
+            active = string_contains(raw, "Status: active")
+            rules = parse_ufw(raw)
+            let v: string = shell(sys::priv("ufw status verbose") + " 2>&1")
+            let d: int = string_find(v, "Default:")
+            if d >= 0 is
+                let line: string = string_slice(v, d, string_len(v))
+                let nl: int = string_find(line, "\n")
+                let l1: string = if nl > 0 then string_slice(line, 0, nl) else line
+                let inc: int = string_find(l1, "(incoming)")
+                let outg: int = string_find(l1, "(outgoing)")
+                if inc > 0 && outg > 0 is
+                    let a: [string] = util::split_clean(string_slice(l1, 8, inc), " ")
+                    let b: [string] = util::split_clean(string_slice(l1, inc + 10, outg), ", ")
+                    if array_len(a) > 0 && array_len(b) > 0 is
+                        defaults = util::jo([util::ks("incoming", a[array_len(a) - 1]), util::ks("outgoing", b[array_len(b) - 1])])
+                    end
+                end
+            end
+        end
+    else if be == "firewalld" is
+        active = string_trim(shell(sys::priv("firewall-cmd --state") + " 2>/dev/null")) == "running"
+        let zi: [string] = zones_info()
+        let mut zone: string = zone0
+        if zone == "" is zone = zi[0] end
+        let mut zl: [string] = []
+        let mut z: int = 1
+        while z < array_len(zi) is
+            zl = array_push(zl, zi[z])
+            z += 1
+        end
+        zones = zl
+        azone = zone
+        let zarg: string = if zone != "" && util::all_in(zone, util::alnum() + "_-") then " --zone=" + zone else ""
+        raw = shell(sys::priv("firewall-cmd --list-all" + zarg) + " 2>&1")
+        rules = parse_firewalld(raw)
+    else if be == "nftables" is
+        let r: [string] = sys::run_rc(sys::priv("nft list ruleset"))
+        raw = r[0]
+        ro = true
+        active = r[1] == "0" && string_trim(raw) != ""
+        msg = "nftables is shown read-only; manage it with ufw or firewalld for editing"
+    else is
+        msg = "no supported firewall found (install ufw)"
+    end
+    pairs = array_push(pairs, util::kv("active", util::jb(active)))
+    pairs = array_push(pairs, util::kv("read_only", util::jb(ro)))
+    pairs = array_push(pairs, util::kv("rules", util::ja(rules)))
+    pairs = array_push(pairs, util::kv("defaults", defaults))
+    pairs = array_push(pairs, util::ks("raw", raw))
+    if msg != "" is pairs = array_push(pairs, util::ks("message", msg)) end
+    if array_len(zones) > 0 is pairs = array_push(pairs, util::kv("zones", util::jstrs(zones))) end
+    if azone != "" is pairs = array_push(pairs, util::ks("active_zone", azone)) end
+    return util::jo(pairs)
+end
+
+pub fn firewall(fd: int, c: [string]) is
+    http::respond_json(fd, 200, util::jo([util::kv("firewall", status_json(ctx::q(c, "zone"))), util::kv("ssh_ports", util::jstrs(ssh_ports()))]))
+end
+
+fn fw_err(fd: int, e: string) is
+    if string_starts_with(e, "CONFIRM:") is
+        http::err_code(fd, 409, "confirm_required", string_slice(e, 8, string_len(e)))
+    else is
+        http::err(fd, 400, e)
+    end
+end
+
+fn has_ssh_allow(status: string) -> bool is
+    let rules: [string] = util::jitems(util::jget(status, "rules"))
+    let ports: [string] = ssh_ports()
+    let mut i: int = 0
+    while i < array_len(rules) is
+        if util::jstr(rules[i], "action") == "ALLOW" is
+            let to: string = util::jstr(rules[i], "to")
+            let mut k: int = 0
+            while k < array_len(ports) is
+                if string_starts_with(to, ports[k]) || string_contains(string_lower(to), "openssh") || string_lower(to) == "ssh" is return true end
+                k += 1
+            end
+        end
+        i += 1
+    end
+    return false
+end
+
+fn touches_ssh(port: string) -> bool is
+    if port == "" is return false end
+    let ports: [string] = ssh_ports()
+    let mut i: int = 0
+    while i < array_len(ports) is
+        if port == ports[i] is return true end
+        let c: int = string_find(port, ":")
+        if c > 0 is
+            let lo: int = util::to_i(string_slice(port, 0, c))
+            let hi: int = util::to_i(string_slice(port, c + 1, string_len(port)))
+            let n: int = util::to_i(ports[i])
+            if n >= lo && n <= hi is return true end
+        end
+        i += 1
+    end
+    return false
+end
+
+fn addr_ok(a: string) -> bool is
+    if a == "any" is return true end
+    return string_len(a) >= 2 && string_len(a) <= 45 && util::all_in(a, "0123456789abcdefABCDEF.:/")
+end
+
+;; "" or error. `b` is the request JSON.
+fn validate_spec(b: string) -> string is
+    let action: string = util::jstr(b, "action")
+    if !util::has(["allow", "deny", "reject", "limit"], action) is return "action must be allow, deny, reject or limit" end
+    if !util::has(["", "in", "out"], util::jstr(b, "direction")) is return "direction must be in or out" end
+    let proto: string = util::jstr(b, "proto")
+    if !util::has(["", "tcp", "udp"], proto) is return "protocol must be tcp or udp" end
+    let port: string = util::jstr(b, "port")
+    if port != "" is
+        if !util::all_in(port, "0123456789:") || string_len(port) > 11 is return "invalid port" end
+        let parts: [string] = string_split(port, ":")
+        if array_len(parts) > 2 is return "invalid port" end
+        let mut i: int = 0
+        while i < array_len(parts) is
+            if !util::is_digits(parts[i]) is return "invalid port" end
+            let n: int = util::to_i(parts[i])
+            if n < 1 || n > 65535 is return "port out of range" end
+            i += 1
+        end
+        if proto == "" && string_contains(port, ":") is return "port ranges require a protocol" end
+    end
+    let from: string = util::jstr(b, "from")
+    if from != "" && !addr_ok(from) is return "invalid source address" end
+    if port == "" && (from == "" || from == "any") is return "a rule needs a port or a source address" end
+    let zone: string = util::jstr(b, "zone")
+    if zone != "" && !util::all_in(zone, util::alnum() + "_-") is return "invalid zone name" end
+    let cm: string = util::jstr(b, "comment")
+    if string_len(cm) > 60 || !util::all_in(cm, util::alnum() + " _.,-") is return "comment contains unsupported characters" end
+    return ""
+end
+
+fn run_fwd(zone: string, arg: string) -> string is
+    let z: string = if zone != "" then " --zone=" + zone else ""
+    let r: [string] = sys::run_rc(sys::priv("firewall-cmd --permanent" + z + " " + util::sq(arg)))
+    if r[1] != "0" is return "exit status " + r[1] + ": " + string_trim(r[0]) end
+    let rr: [string] = sys::run_rc(sys::priv("firewall-cmd --reload"))
+    if rr[1] != "0" is return "exit status " + rr[1] + ": " + string_trim(rr[0]) end
+    return ""
+end
+
+fn add_rule(b: string, confirm: bool) -> string is
+    let e: string = validate_spec(b)
+    if e != "" is return e end
+    let be: string = detect()
+    let action: string = util::jstr(b, "action")
+    let dir: string = util::jstr(b, "direction")
+    let proto: string = util::jstr(b, "proto")
+    let port: string = util::jstr(b, "port")
+    let from: string = util::jstr(b, "from")
+    let lock: string = "CONFIRM:This rule affects the SSH port and could lock you out of this machine."
+    if be == "firewalld" is
+        if (action == "deny" || action == "reject") && dir != "out" && touches_ssh(port) && !confirm is return lock end
+        if action == "allow" && port != "" && from == "" is
+            return run_fwd(util::jstr(b, "zone"), "--add-port=" + string_replace(port, ":", "-") + "/" + (if proto == "" then "tcp" else proto))
+        end
+        if action != "allow" && action != "deny" && action != "reject" is return "firewalld supports allow, deny and reject rules (not " + action + ")" end
+        let mut rule: string = "rule family=\"ipv4\""
+        if from != "" && from != "any" is rule = rule + " source address=\"" + from + "\"" end
+        if port != "" is rule = rule + " port port=\"" + port + "\" protocol=\"" + (if proto == "" then "tcp" else proto) + "\"" end
+        rule = rule + (if action == "allow" then " accept" else if action == "deny" then " drop" else " reject")
+        return run_fwd(util::jstr(b, "zone"), "--add-rich-rule=" + rule)
+    end
+    if be != "ufw" is return "no manageable firewall backend" end
+    if (action == "deny" || action == "reject" || action == "limit") && dir != "out" && touches_ssh(port) && !confirm is return lock end
+    let mut cmd: string = "ufw " + action + " " + (if dir == "" then "in" else dir)
+    if proto != "" is cmd = cmd + " proto " + proto end
+    cmd = cmd + " from " + util::sq(if from == "" then "any" else from) + " to any"
+    if port != "" is cmd = cmd + " port " + port end
+    if util::jstr(b, "comment") != "" is cmd = cmd + " comment " + util::sq(util::jstr(b, "comment")) end
+    let r: [string] = sys::run_rc(sys::priv(cmd))
+    if r[1] != "0" is return "exit status " + r[1] + ": " + string_trim(r[0]) end
+    return ""
+end
+
+pub fn fw_add(fd: int, c: [string]) is
+    let b: string = ctx::body(c)
+    let e: string = add_rule(b, util::jbool(b, "confirm"))
+    if e != "" is
+        fw_err(fd, e)
+        return
+    end
+    audit::log(ctx::user(c), "firewall." + util::jstr(b, "action"), util::jstr(b, "direction") + " " + util::jstr(b, "proto") + " " + util::jstr(b, "port") + " from " + util::jstr(b, "from"))
+    http::ok(fd, "rule added: ")
+end
+
+pub fn fw_delete(fd: int, c: [string], id: string) is
+    let be: string = detect()
+    let mut e: string = ""
+    if be == "ufw" is
+        let n: int = util::to_i(id)
+        if !util::is_digits(id) || n <= 0 || n > 9999 is
+            e = "invalid rule number"
+        else is
+            let r: [string] = sys::run_rc(sys::priv("ufw --force delete " + to_string(n)))
+            if r[1] != "0" is e = "exit status " + r[1] + ": " + string_trim(r[0]) end
+        end
+    else if be == "firewalld" is
+        let cut: int = string_find(id, ":")
+        if cut < 0 is
+            e = "invalid rule id"
+        else is
+            let kind: string = string_slice(id, 0, cut)
+            let val: string = string_slice(id, cut + 1, string_len(id))
+            if kind == "rich" is
+                e = run_fwd("", "--remove-rich-rule=" + val)
+            else if (kind == "port" || kind == "service") && util::all_in(val, util::alnum() + "_.-/") is
+                e = run_fwd("", "--remove-" + kind + "=" + val)
+            else is
+                e = "invalid rule id"
+            end
+        end
+    else is
+        e = "no manageable firewall backend"
+    end
+    if e != "" is
+        fw_err(fd, e)
+        return
+    end
+    audit::log(ctx::user(c), "firewall.delete", id)
+    http::ok(fd, "rule removed")
+end
+
+pub fn fw_toggle(fd: int, c: [string]) is
+    let enabled: bool = util::jbool(ctx::body(c), "enabled")
+    let confirm: bool = util::jbool(ctx::body(c), "confirm")
+    if !enabled && !confirm is
+        fw_err(fd, "CONFIRM:Disabling the firewall exposes every listening service on this machine.")
+        return
+    end
+    let be: string = detect()
+    let mut e: string = ""
+    if be == "ufw" is
+        if enabled && !confirm && !has_ssh_allow(status_json("")) is
+            e = "CONFIRM:No rule allows SSH. Enabling the firewall now can lock you out of a remote machine."
+        else is
+            let r: [string] = sys::run_rc(sys::priv("ufw --force " + (if enabled then "enable" else "disable")))
+            if r[1] != "0" is e = "exit status " + r[1] + ": " + string_trim(r[0]) end
+        end
+    else if be == "firewalld" is
+        let r: [string] = sys::run_rc(sys::priv("systemctl " + (if enabled then "start" else "stop") + " firewalld"))
+        if r[1] != "0" is e = "exit status " + r[1] + ": " + string_trim(r[0]) end
+    else is
+        e = "no manageable firewall backend"
+    end
+    if e != "" is
+        fw_err(fd, e)
+        return
+    end
+    audit::log(ctx::user(c), if enabled then "firewall.enable" else "firewall.disable", "")
+    http::ok(fd, "firewall state updated")
+end
+
+pub fn fw_default(fd: int, c: [string]) is
+    let b: string = ctx::body(c)
+    let dir: string = util::jstr(b, "direction")
+    let pol: string = util::jstr(b, "policy")
+    let mut e: string = ""
+    if detect() != "ufw" is
+        e = "default policies are only supported with ufw"
+    else if dir != "incoming" && dir != "outgoing" is
+        e = "direction must be incoming or outgoing"
+    else if !util::has(["allow", "deny", "reject"], pol) is
+        e = "policy must be allow, deny or reject"
+    else is
+        let st: string = status_json("")
+        if dir == "incoming" && pol != "allow" && !util::jbool(b, "confirm") && util::jbool(st, "active") && !has_ssh_allow(st) is
+            e = "CONFIRM:Blocking incoming traffic without an SSH allow rule can lock you out."
+        else is
+            let r: [string] = sys::run_rc(sys::priv("ufw default " + pol + " " + dir))
+            if r[1] != "0" is e = "exit status " + r[1] + ": " + string_trim(r[0]) end
+        end
+    end
+    if e != "" is
+        fw_err(fd, e)
+        return
+    end
+    audit::log(ctx::user(c), "firewall.default", dir + "=" + pol)
+    http::ok(fd, "default policy updated")
+end
+
+;; Rules exported as specs (ufw only) for settings export.
+pub fn export_specs() -> string is
+    if detect() != "ufw" is return "[]" end
+    let ls: [string] = string_split(shell(sys::priv("ufw show added") + " 2>/dev/null"), "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = util::split_clean(ls[i], " ")
+        if array_len(f) >= 3 && f[0] == "ufw" is
+            let mut dir: string = ""
+            let mut proto: string = ""
+            let mut port: string = ""
+            let mut from: string = ""
+            let mut k: int = 2
+            if f[k] == "in" || f[k] == "out" is
+                dir = f[k]
+                k += 1
+            end
+            if k < array_len(f) && !util::has(["proto", "from", "to", "port", "comment"], f[k]) is
+                let sl: int = string_find(f[k], "/")
+                port = if sl > 0 then string_slice(f[k], 0, sl) else f[k]
+                proto = if sl > 0 then string_slice(f[k], sl + 1, string_len(f[k])) else ""
+                k += 1
+            end
+            while k + 1 < array_len(f) is
+                if f[k] == "proto" is proto = f[k + 1] end
+                if f[k] == "from" is from = f[k + 1] end
+                if f[k] == "port" is port = f[k + 1] end
+                k += 2
+            end
+            out = array_push(out, util::jo([util::ks("action", f[1]), util::ks("direction", dir), util::ks("proto", proto), util::ks("port", port), util::ks("from", from), util::ks("comment", "")]))
+        end
+        i += 1
+    end
+    return util::ja(out)
+end
+
+;; Applies one exported spec (used by settings import). Returns true when added.
+pub fn import_spec(spec: string) -> bool is
+    return add_rule(spec, false) == ""
+end
