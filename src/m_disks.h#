@@ -1,0 +1,158 @@
+mod util
+mod http
+mod ctx
+mod config
+mod settings
+mod system
+mod sys
+
+fn rota_of(n: string) -> bool is
+    let r: string = util::jget(n, "rota")
+    return r == "true" || r == "1" || r == "\"1\""
+end
+
+fn flatten(nodes: [string], parent: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(nodes) is
+        let n: string = nodes[i]
+        let fs: string = util::jstr(n, "fstype")
+        let mount: string = util::jstr(n, "mountpoint")
+        let model: string = string_trim(util::jstr(n, "model"))
+        out = array_push(out, util::jo([util::ks("name", util::jstr(n, "name")), util::ks("type", util::jstr(n, "type")),
+            util::kv("size", util::ji(util::jint(n, "size"))), util::ks("fs", if fs == "null" then "" else fs),
+            util::ks("mount", if mount == "null" then "" else mount), util::ks("model", if model == "null" then "" else model),
+            util::ks("parent", parent), util::kv("rotational", util::jb(rota_of(n)))]))
+        let kids: string = util::jget(n, "children")
+        if kids != "" && kids != "null" is out = array_concat(out, flatten(util::jitems(kids), util::jstr(n, "name"))) end
+        i += 1
+    end
+    return out
+end
+
+pub fn disks(fd: int, c: [string]) is
+    let mut mounts: [string] = []
+    let df: [string] = string_split(shell("df -P -B1 -T 2>/dev/null"), "\n")
+    let mut i: int = 1
+    while i < array_len(df) is
+        let f: [string] = util::split_clean(df[i], " ")
+        if array_len(f) >= 7 && !util::has(["tmpfs", "devtmpfs", "squashfs", "overlay", "efivarfs", "ramfs"], f[1]) is
+            let size: int = util::to_i(f[2])
+            let used: int = util::to_i(f[3])
+            if size > 0 is
+                let mut mp: string = f[6]
+                let mut k: int = 7
+                while k < array_len(f) is
+                    mp = mp + " " + f[k]
+                    k += 1
+                end
+                mounts = array_push(mounts, util::jo([util::ks("source", f[0]), util::ks("fs", f[1]), util::kv("size", util::ji(size)), util::kv("used", util::ji(used)),
+                    util::kv("percent", util::jtenths(used * 1000 / size)), util::ks("mount", mp)]))
+            end
+        end
+        i += 1
+    end
+    let mut blocks: [string] = []
+    let mut msg: string = ""
+    if !util::have("lsblk") is
+        msg = "lsblk is not available"
+    else is
+        let out: string = shell("lsblk -J -b -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,MODEL,ROTA 2>/dev/null")
+        if string_trim(out) == "" is
+            msg = "lsblk is not available"
+        else is
+            blocks = flatten(util::jitems(util::jget(out, "blockdevices")), "")
+        end
+    end
+    let mut pairs: [string] = [util::kv("mounts", util::ja(mounts)), util::kv("blocks", util::ja(blocks))]
+    if msg != "" is pairs = array_push(pairs, util::ks("message", msg)) end
+    http::respond_json(fd, 200, util::jo(pairs))
+end
+
+fn smart_one(dev: string) -> string is
+    let out: string = shell(sys::priv("smartctl -a -j " + util::sq(dev)) + " 2>/dev/null")
+    if string_trim(out) == "" || !string_starts_with(string_trim(out), "{{") is
+        return util::jo([util::ks("device", dev), util::ks("model", ""), util::kv("passed", "null"), util::kv("temp_c", "0"), util::kv("power_on_hours", "0"),
+            util::kv("reallocated", "0"), util::kv("pending", "0"), util::kv("uncorrectable", "0"), util::kv("percentage_used", "-1"),
+            util::kv("media_errors", "0"), util::kv("warnings", "[]"), util::ks("error", "unreadable smartctl output")])
+    end
+    let mut warns: [string] = []
+    let status: string = util::jget(util::jget(out, "smart_status"), "passed")
+    if status == "false" is warns = array_push(warns, "SMART overall health: FAILED") end
+    let temp: int = util::jint(util::jget(out, "temperature"), "current")
+    if temp >= 60 is warns = array_push(warns, "high temperature") end
+    let mut realloc: int = 0
+    let mut pending: int = 0
+    let mut uncorr: int = 0
+    let table: [string] = util::jitems(util::jget(util::jget(out, "ata_smart_attributes"), "table"))
+    let mut i: int = 0
+    while i < array_len(table) is
+        let id: int = util::jint(table[i], "id")
+        let v: int = util::jint(util::jget(table[i], "raw"), "value")
+        if id == 5 is realloc = v end
+        if id == 197 is pending = v end
+        if id == 198 is uncorr = v end
+        i += 1
+    end
+    if realloc > 0 is warns = array_push(warns, "reallocated sectors present") end
+    if pending > 0 is warns = array_push(warns, "sectors pending reallocation") end
+    if uncorr > 0 is warns = array_push(warns, "offline uncorrectable sectors") end
+    let nv: string = util::jget(out, "nvme_smart_health_information_log")
+    let mut pct: int = -1
+    let mut merr: int = 0
+    if nv != "" is
+        pct = util::jint(nv, "percentage_used")
+        merr = util::jint(nv, "media_errors")
+        if util::jint(nv, "critical_warning") != 0 is warns = array_push(warns, "NVMe critical warning flag set") end
+        if merr > 0 is warns = array_push(warns, "media errors reported") end
+        if pct >= 90 is warns = array_push(warns, "endurance almost consumed") end
+    end
+    return util::jo([util::ks("device", dev), util::ks("model", util::jstr(out, "model_name")),
+        util::kv("passed", if status == "" then "null" else status), util::kv("temp_c", util::ji(temp)),
+        util::kv("power_on_hours", util::ji(util::jint(util::jget(out, "power_on_time"), "hours"))), util::kv("reallocated", util::ji(realloc)),
+        util::kv("pending", util::ji(pending)), util::kv("uncorrectable", util::ji(uncorr)), util::kv("percentage_used", util::ji(pct)),
+        util::kv("media_errors", util::ji(merr)), util::kv("warnings", util::jstrs(warns))])
+end
+
+pub fn smart(fd: int, c: [string]) is
+    if !util::have("smartctl") is
+        http::respond_json(fd, 200, util::jo([util::kv("drives", "[]"), util::ks("message", "smartctl (smartmontools) is not installed")]))
+        return
+    end
+    let scan: string = shell(sys::priv("smartctl --scan -j") + " 2>/dev/null")
+    let devs: [string] = util::jitems(util::jget(scan, "devices"))
+    let mut res: [string] = []
+    let mut i: int = 0
+    while i < array_len(devs) && i < 16 is
+        let name: string = util::jstr(devs[i], "name")
+        if string_len(name) > 5 && string_starts_with(name, "/dev/") && util::all_in(string_slice(name, 5, string_len(name)), util::alnum()) is
+            res = array_push(res, smart_one(name))
+        end
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("drives", util::ja(res))]))
+end
+
+;; ── diagnostics ──────────────────────────────────────────────────────────────
+
+pub fn diagnostics(fd: int, c: [string]) is
+    let dns: bool = string_trim(shell("timeout 3 getent hosts example.com 2>/dev/null")) != ""
+    let net: bool = string_trim(shell("timeout 3 sh -c 'echo > /dev/tcp/1.1.1.1/443' 2>/dev/null && echo ok || (timeout 3 sh -c \"echo > /dev/tcp/8.8.8.8/53\" 2>/dev/null && echo ok)")) == "ok"
+    let m: [int] = system::mem()
+    let d: [int] = system::disk_of("/")
+    let dt: int = if d[0] > 0 then d[1] * 1000 / d[0] else 0
+    let mt: int = if m[0] > 0 then m[1] * 1000 / m[0] else 0
+    let load_s: string = system::load1_raw()
+    let load_parts: [string] = string_split(load_s, ".")
+    let load_t: int = util::to_i(load_parts[0]) * 10 + (if array_len(load_parts) > 1 then util::to_i(string_slice(load_parts[1] + "0", 0, 1)) else 0)
+    let cores: int = system::cores()
+    let mut pairs: [string] = [util::kv("disk_ok", util::jb(dt < settings::disk_warn() * 10)), util::kv("disk_pct", util::jtenths(dt)),
+        util::kv("memory_ok", util::jb(mt < settings::mem_warn() * 10)), util::kv("memory_pct", util::jtenths(mt)),
+        util::kv("cpu_ok", util::jb(load_t * 2 < cores * 30)), util::kv("cpu_load", util::jtenths(load_t)), util::kv("cores", util::ji(cores)),
+        util::kv("dns_ok", util::jb(dns)), util::kv("network_ok", util::jb(net))]
+    if util::have("sensors") is
+        let s: string = shell("timeout 5 sensors 2>/dev/null | head -c 3000" + sys::json_safe())
+        if s != "" is pairs = array_push(pairs, util::ks("sensors_info", s)) end
+    end
+    http::respond_json(fd, 200, util::jo(pairs))
+end
