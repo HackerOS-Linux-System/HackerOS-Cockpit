@@ -1,0 +1,306 @@
+mod util
+mod crypto
+mod http
+mod ctx
+mod audit
+mod sys
+
+fn disabled_prefix() -> string is return "#HCKPT-DISABLED# " end
+
+fn field_ok(x: string) -> bool is
+    if x == "" || !util::all_in(x, util::alnum() + "*-/,") is return false end
+    let mut cut: int = string_len(x)
+    let mut i: int = 0
+    while i < string_len(x) is
+        let ch: string = string_at(x, i)
+        if (ch == "-" || ch == "/" || ch == ",") && cut == string_len(x) is cut = i end
+        i += 1
+    end
+    let head: string = string_slice(x, 0, cut)
+    if head == "*" is return true end
+    if util::is_digits(head) is return true end
+    return string_len(head) == 3 && util::all_in(head, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+end
+
+fn is_macro(s: string) -> bool is
+    return util::has(["@reboot", "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly"], s)
+end
+
+fn is_env(t: string) -> bool is
+    let eq: int = string_find(t, "=")
+    if eq <= 0 is return false end
+    let name: string = string_trim(string_slice(t, 0, eq))
+    if string_len(name) == 0 || string_contains("0123456789", string_at(name, 0)) is return false end
+    return util::all_in(name, util::alnum() + "_")
+end
+
+;; [schedule, command] or [] when not a job line.
+fn split_job(t: string) -> [string] is
+    let f: [string] = util::split_clean(string_replace(t, "\t", " "), " ")
+    if array_len(f) >= 2 && is_macro(f[0]) is
+        return [f[0], string_trim(string_slice(t, string_len(f[0]), string_len(t)))]
+    end
+    if array_len(f) < 6 is return [] end
+    let mut i: int = 0
+    while i < 5 is
+        if !field_ok(f[i]) is return [] end
+        i += 1
+    end
+    let mut rest: string = t
+    let mut k: int = 0
+    while k < 5 is
+        rest = string_trim(string_slice(string_trim(rest), string_len(f[k]), string_len(string_trim(rest))))
+        k += 1
+    end
+    return [util::join([f[0], f[1], f[2], f[3], f[4]], " "), rest]
+end
+
+fn managed_id(cmd: string) -> string is
+    let m: int = string_rfind(cmd, "hckpt-managed:")
+    if m < 0 is return "" end
+    let id: string = string_trim(string_slice(cmd, m + 14, string_len(cmd)))
+    if id != "" && util::all_in(id, util::alnum() + "_.-") is return id end
+    return ""
+end
+
+pub fn fp_of(raw: string) -> string is
+    return string_slice(crypto::sha256_hex(raw), 0, 12)
+end
+
+;; JSON entry for one crontab line.
+fn parse_line(i: int, raw: string) -> string is
+    let t0: string = string_trim(raw)
+    let mut pairs: [string] = [util::kv("index", util::ji(i)), util::ks("raw", raw)]
+    if t0 == "" is
+        return util::jo(array_concat(pairs, [util::ks("kind", "blank"), util::kv("enabled", "true"), util::ks("fp", fp_of(raw))]))
+    end
+    let mut enabled: bool = true
+    let mut t: string = t0
+    if string_starts_with(raw, disabled_prefix()) is
+        enabled = false
+        t = string_trim(string_slice(raw, string_len(disabled_prefix()), string_len(raw)))
+    else if string_starts_with(t0, "#") is
+        return util::jo(array_concat(pairs, [util::ks("kind", "comment"), util::kv("enabled", "true"), util::ks("fp", fp_of(raw))]))
+    end
+    let sj: [string] = split_job(t)
+    if is_env(t) && array_len(sj) == 0 is
+        return util::jo(array_concat(pairs, [util::ks("kind", "env"), util::kv("enabled", util::jb(enabled)), util::ks("fp", fp_of(raw))]))
+    end
+    if array_len(sj) == 0 is
+        return util::jo(array_concat(pairs, [util::ks("kind", "comment"), util::kv("enabled", util::jb(enabled)), util::ks("fp", fp_of(raw))]))
+    end
+    pairs = array_concat(pairs, [util::ks("kind", "job"), util::kv("enabled", util::jb(enabled)), util::ks("schedule", sj[0]), util::ks("command", sj[1])])
+    let mid: string = managed_id(sj[1])
+    if mid != "" is pairs = array_push(pairs, util::ks("managed", mid)) end
+    return util::jo(array_push(pairs, util::ks("fp", fp_of(raw))))
+end
+
+fn validate_line(line0: string) -> string is
+    let line: string = string_trim(line0)
+    if line == "" || string_len(line) > 1000 is return "empty or too long" end
+    if string_contains(line, "\n") || string_contains(line, "\r") is return "a cron entry must be a single line" end
+    if string_starts_with(line, "#") is return "comments are not accepted here" end
+    let sj: [string] = split_job(line)
+    if is_env(line) && array_len(sj) == 0 is return "" end
+    if array_len(sj) == 0 is return "expected 5 schedule fields (or @daily etc.) followed by a command" end
+    if string_trim(sj[1]) == "" is return "missing command" end
+    return ""
+end
+
+;; [error, lines...] — error is "" on success.
+fn read_lines() -> [string] is
+    let r: [string] = sys::run_rc("crontab -l")
+    if r[1] != "0" is
+        if string_contains(r[0], "no crontab") is return [""] end
+        return ["crontab: exit status " + r[1] + " " + string_trim(r[0])]
+    end
+    let body: string = if string_ends_with(r[0], "\n") then string_slice(r[0], 0, string_len(r[0]) - 1) else r[0]
+    if body == "" is return [""] end
+    let parts: [string] = string_split(body, "\n")
+    return array_concat([""], parts)
+end
+
+fn write_lines(lines: [string]) -> string is
+    let body: string = if array_len(lines) == 0 then "" else util::join(lines, "\n") + "\n"
+    let tmp: string = "/tmp/.hckpt-cron." + random_hex(6)
+    file_write(tmp, body)
+    let r: [string] = sys::run_rc("crontab " + util::sq(tmp))
+    shell("rm -f " + util::sq(tmp))
+    if r[1] != "0" is return "crontab: exit status " + r[1] + " " + string_trim(r[0]) end
+    return ""
+end
+
+fn body_lines(all: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 1
+    while i < array_len(all) is
+        out = array_push(out, all[i])
+        i += 1
+    end
+    return out
+end
+
+fn check(lines: [string], idx: int, fp: string) -> string is
+    if idx < 0 || idx >= array_len(lines) is return "entry not found (the crontab changed — reload)" end
+    if fp != "" && fp_of(lines[idx]) != fp is return "the crontab changed since it was loaded — reload and retry" end
+    return ""
+end
+
+pub fn cron_list(fd: int, c: [string]) is
+    let all: [string] = read_lines()
+    if all[0] != "" is
+        http::err(fd, 502, all[0])
+        return
+    end
+    let lines: [string] = body_lines(all)
+    let mut rows: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        rows = array_push(rows, parse_line(i, lines[i]))
+        i += 1
+    end
+    http::respond_json(fd, 200, util::jo([util::kv("entries", util::ja(rows))]))
+end
+
+pub fn cron_add(fd: int, c: [string]) is
+    let line: string = ctx::bstr(c, "line")
+    let e: string = validate_line(line)
+    if e != "" is
+        http::err(fd, 400, e)
+        return
+    end
+    let all: [string] = read_lines()
+    if all[0] != "" is
+        http::err(fd, 400, all[0])
+        return
+    end
+    let mut lines: [string] = body_lines(all)
+    let comment: string = string_trim(string_replace(ctx::bstr(c, "comment"), "\n", " "))
+    if comment != "" is lines = array_push(lines, "# " + comment) end
+    lines = array_push(lines, string_trim(line))
+    let w: string = write_lines(lines)
+    if w != "" is
+        http::err(fd, 400, w)
+        return
+    end
+    audit::log(ctx::user(c), "cron.add", line)
+    http::ok(fd, "job added")
+end
+
+fn modify(fd: int, c: [string], idx: int, mode: string) is
+    ;; mode: update | remove | toggle
+    let fp: string = if mode == "remove" then ctx::q(c, "fp") else ctx::bstr(c, "fp")
+    let all: [string] = read_lines()
+    if all[0] != "" is
+        http::err(fd, 400, all[0])
+        return
+    end
+    let lines: [string] = body_lines(all)
+    let ce: string = check(lines, idx, fp)
+    if ce != "" is
+        http::err(fd, 400, ce)
+        return
+    end
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        if i != idx || mode == "update" || mode == "toggle" is
+            out = array_push(out, lines[i])
+        end
+        i += 1
+    end
+    if mode == "update" is
+        let line: string = ctx::bstr(c, "line")
+        let e: string = validate_line(line)
+        if e != "" is
+            http::err(fd, 400, e)
+            return
+        end
+        let was_off: bool = string_starts_with(lines[idx], disabled_prefix())
+        out[idx] = string_trim(if was_off then disabled_prefix() + string_trim(line) else line)
+    end
+    if mode == "toggle" is
+        let raw: string = lines[idx]
+        let pj: string = parse_line(idx, raw)
+        if util::jstr(pj, "kind") != "job" is
+            http::err(fd, 400, "only jobs can be toggled")
+            return
+        end
+        if util::jbool(pj, "enabled") is
+            out[idx] = disabled_prefix() + string_trim(raw)
+        else is
+            out[idx] = string_trim(string_slice(raw, string_len(disabled_prefix()), string_len(raw)))
+        end
+    end
+    let w: string = write_lines(out)
+    if w != "" is
+        http::err(fd, 400, w)
+        return
+    end
+    audit::log(ctx::user(c), "cron." + mode, if mode == "update" then ctx::bstr(c, "line") else to_string(idx))
+    http::ok(fd, if mode == "update" then "job updated" else if mode == "remove" then "job removed" else "job toggled")
+end
+
+pub fn cron_update(fd: int, c: [string], idx_s: string) is
+    if !util::is_digits(idx_s) is
+        http::err(fd, 400, "invalid index")
+        return
+    end
+    modify(fd, c, util::to_i(idx_s), "update")
+end
+
+pub fn cron_remove(fd: int, c: [string], idx_s: string) is
+    if !util::is_digits(idx_s) is
+        http::err(fd, 400, "invalid index")
+        return
+    end
+    modify(fd, c, util::to_i(idx_s), "remove")
+end
+
+pub fn cron_toggle(fd: int, c: [string], idx_s: string) is
+    if !util::is_digits(idx_s) is
+        http::err(fd, 400, "invalid index")
+        return
+    end
+    modify(fd, c, util::to_i(idx_s), "toggle")
+end
+
+;; ── panel-managed jobs (backups) ─────────────────────────────────────────────
+
+pub fn set_managed(id: string, schedule: string, command: string) -> string is
+    if id == "" || !util::all_in(id, util::alnum() + "_.-") is return "invalid id" end
+    let line: string = schedule + " " + command + " # hckpt-managed:" + id
+    let e: string = validate_line(line)
+    if e != "" is return e end
+    let all: [string] = read_lines()
+    if all[0] != "" is return all[0] end
+    let lines: [string] = body_lines(all)
+    let mut out: [string] = []
+    let mut hit: bool = false
+    let mut i: int = 0
+    while i < array_len(lines) is
+        if util::jstr(parse_line(i, lines[i]), "managed") == id && !hit is
+            out = array_push(out, line)
+            hit = true
+        else is
+            out = array_push(out, lines[i])
+        end
+        i += 1
+    end
+    if !hit is out = array_push(out, line) end
+    return write_lines(out)
+end
+
+pub fn remove_managed(id: string) -> string is
+    let all: [string] = read_lines()
+    if all[0] != "" is return all[0] end
+    let lines: [string] = body_lines(all)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        if util::jstr(parse_line(i, lines[i]), "managed") != id is out = array_push(out, lines[i]) end
+        i += 1
+    end
+    if array_len(out) == array_len(lines) is return "" end
+    return write_lines(out)
+end
